@@ -8,8 +8,8 @@ test("CLOB getOrderBook builds request", async () => {
 
   // Mock global fetch
   const calls: string[] = [];
-  // @ts-expect-error - test override
-  global.fetch = async (url: any) => {
+  const globalAny = globalThis as typeof globalThis & { fetch: any };
+  globalAny.fetch = async (url: any) => {
     calls.push(String(url));
     return {
       ok: true,

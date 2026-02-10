@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "bot:once": "tsx src/index.ts --once",
+    "bot:ticks": "tsx src/index.ts --ticks 5 --interval-ms 5000",
+    "bot:ui": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "lint": "eslint .",
