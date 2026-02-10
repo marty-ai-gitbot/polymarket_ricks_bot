@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "format": "prettier -w .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test"
+    "test": "node --import tsx --test"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

@@ -16,6 +16,7 @@ const EnvSchema = z.object({
 
   // Polymarket
   POLYMARKET_CLOB_BASE_URL: z.string().default("https://clob.polymarket.com"),
+  POLYMARKET_GAMMA_BASE_URL: z.string().default("https://gamma-api.polymarket.com"),
 
   // Strategy / selection
   TARGETS_MODE: z.enum(["top_volume", "easy_targets", "slugs"]).default("top_volume"),
