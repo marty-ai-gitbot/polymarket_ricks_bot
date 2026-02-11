@@ -1534,7 +1534,7 @@ async function summarize(runtime: Runtime): Promise<Summary> {
   const sampleTokenId = await (async () => {
     const fromBooks = pickSampleTokenIdFromBooks(books);
     try {
-      const gamma = await getGammaMarketsCached(runtime);
+      const gamma = await getGammaMarketsCached(runtime, { activeOnly: true, includeResolved: false });
       const fromMarkets = pickSampleTokenIdFromMarkets(gamma.items);
       return fromMarkets ?? fromBooks;
     } catch {
@@ -3196,6 +3196,8 @@ function renderMarketsPage(port: number) {
         maxSpreadBps: "",
         minLiquidityUsd: "",
         q: "",
+        activeOnly: true,
+        includeResolved: false,
         totalCount: 0,
         lastUpdated: null,
         autoRefresh: false,
@@ -3242,6 +3244,8 @@ function renderMarketsPage(port: number) {
         if (state.maxSpreadBps) params.push("max_spread_bps=" + encodeURIComponent(String(state.maxSpreadBps)));
         if (state.minLiquidityUsd) params.push("min_liquidity_usd=" + encodeURIComponent(String(state.minLiquidityUsd)));
         if (state.q) params.push("q=" + encodeURIComponent(String(state.q)));
+        params.push("active_only=" + encodeURIComponent(String(state.activeOnly)));
+        params.push("include_resolved=" + encodeURIComponent(String(state.includeResolved)));
         return "/api/markets/live?" + params.join("&");
       }
 
@@ -3424,6 +3428,8 @@ function renderMarketsPage(port: number) {
         var query = byId("filterQuery");
         var sort = byId("sortSelect");
         var pageSize = byId("pageSizeSelect");
+        var activeOnly = byId("filterActiveOnly");
+        var includeResolved = byId("filterIncludeResolved");
         if (selector) state.selector = selector.value || "top_volume";
         if (sort) state.sort = sort.value || "volume_desc";
         if (pageSize) state.limit = Number(pageSize.value || 25);
@@ -3431,6 +3437,8 @@ function renderMarketsPage(port: number) {
         state.maxSpreadBps = maxSpread ? maxSpread.value : "";
         state.minLiquidityUsd = minLiquidity ? minLiquidity.value : "";
         state.q = query ? query.value : "";
+        state.activeOnly = activeOnly ? !!activeOnly.checked : true;
+        state.includeResolved = includeResolved ? !!includeResolved.checked : false;
         state.offset = 0;
       }
 
@@ -3450,7 +3458,7 @@ function renderMarketsPage(port: number) {
           fetchMarkets();
         });
 
-        var filterIds = ["filterSelector", "filterMinVolume", "filterMaxSpread", "filterMinLiquidity", "filterQuery", "sortSelect", "pageSizeSelect"];
+        var filterIds = ["filterSelector", "filterMinVolume", "filterMaxSpread", "filterMinLiquidity", "filterQuery", "sortSelect", "pageSizeSelect", "filterActiveOnly", "filterIncludeResolved"];
         filterIds.forEach(function (id) {
           var el = byId(id);
           if (!el) return;
