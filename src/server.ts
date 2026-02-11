@@ -2784,6 +2784,497 @@ function renderDashboard(port: number) {
 </html>`;
 }
 
+function renderMarketsPage(port: number) {
+  return `<!doctype html>
+<html class="h-full" lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b1020" />
+    <title>Polymarket Markets</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              display: ["Space Grotesk", "ui-sans-serif", "system-ui"],
+              body: ["IBM Plex Sans", "ui-sans-serif", "system-ui"]
+            },
+            boxShadow: {
+              glow: "0 0 60px rgba(14, 116, 144, 0.2)"
+            }
+          }
+        }
+      };
+    </script>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+    <style>
+      ::-webkit-scrollbar { width: 10px; height: 10px; }
+      ::-webkit-scrollbar-thumb { background: #1f2937; border-radius: 999px; }
+      ::-webkit-scrollbar-track { background: #0b1020; }
+      .grid-card { background: rgba(15, 23, 42, 0.78); border: 1px solid rgba(148, 163, 184, 0.2); }
+      .soft-ring { box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.2); }
+      .fade-in { animation: fade 0.5s ease-out; }
+      @keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+  </head>
+  <body class="min-h-full bg-gradient-to-b from-slate-950 via-slate-950 to-slate-900 text-slate-100 font-body">
+    <div class="absolute inset-0 pointer-events-none">
+      <div class="absolute -top-32 left-1/2 h-72 w-72 -translate-x-1/2 rounded-full bg-cyan-500/10 blur-3xl"></div>
+      <div class="absolute top-1/3 right-0 h-80 w-80 translate-x-1/3 rounded-full bg-emerald-500/10 blur-3xl"></div>
+      <div class="absolute bottom-0 left-0 h-72 w-72 -translate-x-1/3 rounded-full bg-sky-400/10 blur-3xl"></div>
+    </div>
+    <main class="relative mx-auto flex max-w-7xl flex-col gap-6 px-6 py-8 lg:px-10">
+      <header class="grid-card rounded-3xl p-6 shadow-glow">
+        <div class="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <p class="text-xs uppercase tracking-[0.24em] text-cyan-200">Live Markets</p>
+            <h1 class="mt-2 text-2xl font-semibold font-display">Polymarket Markets</h1>
+            <p class="mt-2 text-sm text-slate-400">Browse live markets with pagination, filters, and sorting.</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <a class="rounded-full border border-slate-700 px-4 py-2 text-slate-200 transition hover:border-cyan-400" href="/">Overview</a>
+            <button id="refreshMarkets" class="rounded-full border border-slate-700 px-4 py-2 text-slate-200 transition hover:border-cyan-400" type="button">Refresh</button>
+          </div>
+        </div>
+        <div class="mt-5 grid gap-4 lg:grid-cols-[1.2fr,0.8fr]">
+          <div class="grid-card rounded-2xl p-5">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p class="text-xs uppercase tracking-[0.2em] text-slate-300">Filters</p>
+                <p class="mt-1 text-sm text-slate-400">Fine tune the market list.</p>
+              </div>
+              <div class="text-xs text-slate-400">
+                <span id="resultsMeta">0 markets</span>
+              </div>
+            </div>
+            <div class="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              <div>
+                <label class="text-xs text-slate-400">Selector</label>
+                <select id="filterSelector" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100">
+                  <option value="top_volume">top_volume</option>
+                  <option value="easy_targets">easy_targets</option>
+                  <option value="slugs">slugs</option>
+                </select>
+              </div>
+              <div>
+                <label class="text-xs text-slate-400">Min volume (USD)</label>
+                <input id="filterMinVolume" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" placeholder="0" />
+              </div>
+              <div>
+                <label class="text-xs text-slate-400">Max spread (bps)</label>
+                <input id="filterMaxSpread" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" placeholder="0" />
+              </div>
+              <div>
+                <label class="text-xs text-slate-400">Min liquidity (USD)</label>
+                <input id="filterMinLiquidity" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" placeholder="0" />
+              </div>
+              <div class="sm:col-span-2">
+                <label class="text-xs text-slate-400">Search</label>
+                <input id="filterQuery" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="text" placeholder="Search slug or question" />
+              </div>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+              <div class="flex flex-wrap items-center gap-3">
+                <label class="flex items-center gap-2">
+                  <input id="autoRefreshToggle" type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-cyan-400" />
+                  Auto-refresh
+                </label>
+                <span id="lastUpdated">Last updated: --</span>
+              </div>
+              <div id="marketsStatus" class="text-slate-400">Loading markets...</div>
+            </div>
+          </div>
+          <div class="grid-card rounded-2xl p-5">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p class="text-xs uppercase tracking-[0.2em] text-slate-300">Sort</p>
+                <p class="mt-1 text-sm text-slate-400">Order the results.</p>
+              </div>
+            </div>
+            <div class="mt-4 space-y-4">
+              <div>
+                <label class="text-xs text-slate-400">Sort by</label>
+                <select id="sortSelect" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100">
+                  <option value="volume_desc">Volume (desc)</option>
+                  <option value="spread_asc">Spread (asc)</option>
+                  <option value="updated_desc">Updated (desc)</option>
+                </select>
+              </div>
+              <div>
+                <label class="text-xs text-slate-400">Page size</label>
+                <select id="pageSizeSelect" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100">
+                  <option value="25">25</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+              </div>
+              <div class="rounded-2xl bg-slate-950/60 p-4 soft-ring text-xs text-slate-400">
+                <div class="flex items-center justify-between">
+                  <span>Page</span>
+                  <span id="pageLabel">1</span>
+                </div>
+                <div class="mt-2 flex items-center justify-between">
+                  <span>Showing</span>
+                  <span id="pageRange">--</span>
+                </div>
+                <div class="mt-2 flex items-center justify-between">
+                  <span>Total</span>
+                  <span id="totalCount">0</span>
+                </div>
+              </div>
+              <div class="flex items-center gap-2">
+                <button id="prevPage" class="flex-1 rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-cyan-400" type="button">Prev</button>
+                <button id="nextPage" class="flex-1 rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-cyan-400" type="button">Next</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <section class="grid-card rounded-3xl p-6 shadow-glow">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p class="text-xs uppercase tracking-[0.2em] text-emerald-200">Market Table</p>
+            <h2 class="mt-2 text-lg font-semibold">Live Markets</h2>
+          </div>
+          <div id="marketsMeta" class="text-xs text-slate-400"></div>
+        </div>
+
+        <div class="mt-4 hidden overflow-x-auto md:block">
+          <table class="min-w-full text-left text-xs">
+            <thead class="sticky top-0 z-10 bg-slate-950 text-slate-400">
+              <tr>
+                <th class="px-3 py-2">Slug</th>
+                <th class="px-3 py-2">Title</th>
+                <th class="px-3 py-2 text-right">Volume</th>
+                <th class="px-3 py-2 text-right">Liquidity</th>
+                <th class="px-3 py-2 text-right">Spread</th>
+                <th class="px-3 py-2 text-right">Midpoint</th>
+                <th class="px-3 py-2">Updated</th>
+              </tr>
+            </thead>
+            <tbody id="marketsTable" class="text-slate-100"></tbody>
+          </table>
+        </div>
+
+        <div id="marketsCards" class="mt-4 grid gap-3 md:hidden"></div>
+      </section>
+    </main>
+
+    <script>
+      var state = {
+        selector: "top_volume",
+        sort: "volume_desc",
+        limit: 25,
+        offset: 0,
+        minVolume: "",
+        maxSpreadBps: "",
+        minLiquidityUsd: "",
+        q: "",
+        totalCount: 0,
+        lastUpdated: null,
+        autoRefresh: false,
+        timer: null
+      };
+
+      function byId(id) {
+        return document.getElementById(id);
+      }
+
+      function setText(id, value) {
+        var el = byId(id);
+        if (el) el.textContent = value;
+      }
+
+      function formatNumber(value, digits) {
+        if (value === null || value === undefined || value === "") return "--";
+        var num = Number(value);
+        if (!Number.isFinite(num)) return "--";
+        return num.toFixed(digits);
+      }
+
+      function formatCurrency(value) {
+        if (value === null || value === undefined || value === "") return "--";
+        var num = Number(value);
+        if (!Number.isFinite(num)) return "--";
+        return "$" + num.toFixed(2);
+      }
+
+      function formatTime(ts) {
+        if (!ts) return "--";
+        var date = new Date(ts);
+        if (Number.isNaN(date.getTime())) return "--";
+        return date.toLocaleString();
+      }
+
+      function buildQuery() {
+        var params = [];
+        params.push("limit=" + encodeURIComponent(String(state.limit)));
+        params.push("offset=" + encodeURIComponent(String(state.offset)));
+        params.push("selector=" + encodeURIComponent(String(state.selector)));
+        params.push("sort=" + encodeURIComponent(String(state.sort)));
+        if (state.minVolume) params.push("min_volume=" + encodeURIComponent(String(state.minVolume)));
+        if (state.maxSpreadBps) params.push("max_spread_bps=" + encodeURIComponent(String(state.maxSpreadBps)));
+        if (state.minLiquidityUsd) params.push("min_liquidity_usd=" + encodeURIComponent(String(state.minLiquidityUsd)));
+        if (state.q) params.push("q=" + encodeURIComponent(String(state.q)));
+        return "/api/markets/live?" + params.join("&");
+      }
+
+      function renderStatus(payload) {
+        var el = byId("marketsStatus");
+        var meta = byId("marketsMeta");
+        if (!el) return;
+        var status = payload && payload.status ? payload.status : "ok";
+        var message = "";
+        var cls = "text-slate-400";
+        if (status === "ok") {
+          message = "Markets loaded.";
+          cls = "text-emerald-200";
+        } else if (status === "partial") {
+          message = payload.error || "Partial order books loaded.";
+          cls = "text-amber-200";
+        } else if (status === "rate_limited") {
+          message = payload.error || "Rate limited. Retrying soon.";
+          cls = "text-amber-200";
+        } else if (status === "offline") {
+          message = payload.error || "Offline: cannot reach Polymarket.";
+          cls = "text-red-200";
+        } else if (status === "empty") {
+          message = "No markets returned.";
+          cls = "text-slate-400";
+        } else if (status === "loading") {
+          message = "Loading markets...";
+          cls = "text-slate-400";
+        }
+        el.textContent = message;
+        el.className = cls;
+        if (meta) {
+          var parts = [];
+          if (payload && payload.cached) parts.push("cached");
+          if (payload && payload.ageMs != null) parts.push(Math.round(Number(payload.ageMs) / 1000) + "s old");
+          meta.textContent = parts.join(" • ");
+        }
+      }
+
+      function renderTable(items) {
+        var table = byId("marketsTable");
+        if (!table) return;
+        table.innerHTML = "";
+        if (!items || items.length === 0) {
+          var emptyRow = document.createElement("tr");
+          var emptyCell = document.createElement("td");
+          emptyCell.colSpan = 7;
+          emptyCell.className = "px-3 py-4 text-slate-400";
+          emptyCell.textContent = "No markets to display.";
+          emptyRow.appendChild(emptyCell);
+          table.appendChild(emptyRow);
+          return;
+        }
+        items.forEach(function (item, idx) {
+          var row = document.createElement("tr");
+          row.className = (idx % 2 === 0 ? "bg-slate-950/60" : "bg-slate-900/60") + " fade-in";
+          var cells = [
+            { text: item.slug || "--", cls: "px-3 py-3" },
+            { text: item.title || "--", cls: "px-3 py-3" },
+            { text: formatCurrency(item.volume), cls: "px-3 py-3 text-right font-mono" },
+            { text: formatCurrency(item.liquidityUsd), cls: "px-3 py-3 text-right font-mono" },
+            { text: item.spreadBps != null ? formatNumber(item.spreadBps, 1) + " bps" : "--", cls: "px-3 py-3 text-right font-mono" },
+            { text: formatNumber(item.midpoint, 4), cls: "px-3 py-3 text-right font-mono" },
+            { text: formatTime(item.updatedAt), cls: "px-3 py-3 text-slate-300" }
+          ];
+          cells.forEach(function (cell) {
+            var td = document.createElement("td");
+            td.className = cell.cls;
+            td.textContent = String(cell.text);
+            row.appendChild(td);
+          });
+          table.appendChild(row);
+        });
+      }
+
+      function renderCards(items) {
+        var wrap = byId("marketsCards");
+        if (!wrap) return;
+        wrap.innerHTML = "";
+        if (!items || items.length === 0) {
+          var empty = document.createElement("div");
+          empty.className = "rounded-2xl border border-dashed border-slate-800 bg-slate-950/60 px-4 py-6 text-center text-sm text-slate-400";
+          empty.textContent = "No markets to display.";
+          wrap.appendChild(empty);
+          return;
+        }
+        items.forEach(function (item) {
+          var card = document.createElement("div");
+          card.className = "grid-card rounded-2xl p-4 fade-in";
+          var title = document.createElement("div");
+          title.className = "text-sm font-semibold";
+          title.textContent = item.title || item.slug || "--";
+          var subtitle = document.createElement("div");
+          subtitle.className = "mt-1 text-xs text-slate-400";
+          subtitle.textContent = item.slug || "--";
+          var grid = document.createElement("div");
+          grid.className = "mt-3 grid grid-cols-2 gap-2 text-xs";
+          var fields = [
+            { label: "Volume", value: formatCurrency(item.volume) },
+            { label: "Liquidity", value: formatCurrency(item.liquidityUsd) },
+            { label: "Spread", value: item.spreadBps != null ? formatNumber(item.spreadBps, 1) + " bps" : "--" },
+            { label: "Midpoint", value: formatNumber(item.midpoint, 4) },
+            { label: "Updated", value: formatTime(item.updatedAt) }
+          ];
+          fields.forEach(function (field) {
+            var cell = document.createElement("div");
+            cell.className = "rounded-xl bg-slate-950/60 p-2 soft-ring";
+            var label = document.createElement("div");
+            label.className = "text-[10px] uppercase tracking-[0.2em] text-slate-500";
+            label.textContent = field.label;
+            var value = document.createElement("div");
+            value.className = "mt-1 font-mono text-slate-100";
+            value.textContent = field.value;
+            cell.appendChild(label);
+            cell.appendChild(value);
+            grid.appendChild(cell);
+          });
+          card.appendChild(title);
+          card.appendChild(subtitle);
+          card.appendChild(grid);
+          wrap.appendChild(card);
+        });
+      }
+
+      function renderPagination() {
+        var total = state.totalCount || 0;
+        var start = total === 0 ? 0 : state.offset + 1;
+        var end = Math.min(state.offset + state.limit, total);
+        setText("pageLabel", String(Math.floor(state.offset / state.limit) + 1));
+        setText("pageRange", start + "-" + end);
+        setText("totalCount", String(total));
+        setText("resultsMeta", total + " markets");
+        var prevBtn = byId("prevPage");
+        var nextBtn = byId("nextPage");
+        if (prevBtn) prevBtn.disabled = state.offset === 0;
+        if (nextBtn) nextBtn.disabled = state.offset + state.limit >= total;
+      }
+
+      function setLastUpdated(ts) {
+        state.lastUpdated = ts;
+        setText("lastUpdated", "Last updated: " + formatTime(ts));
+      }
+
+      function renderLoading() {
+        renderStatus({ status: "loading" });
+        renderTable([]);
+        renderCards([]);
+      }
+
+      function fetchMarkets() {
+        renderLoading();
+        var url = buildQuery();
+        return fetch(url).then(function (res) {
+          return res
+            .json()
+            .catch(function () { return {}; })
+            .then(function (data) {
+              return { ok: res.ok, status: res.status, data: data };
+            });
+        }).then(function (payload) {
+          var data = payload.data || {};
+          state.totalCount = Number(data.totalCount || 0);
+          setLastUpdated(data.updatedAt || null);
+          renderStatus(data);
+          renderTable(data.items || []);
+          renderCards(data.items || []);
+          renderPagination();
+        }).catch(function () {
+          renderStatus({ status: "offline", error: "Unable to fetch markets." });
+          renderTable([]);
+          renderCards([]);
+        });
+      }
+
+      function applyFiltersFromUi() {
+        var selector = byId("filterSelector");
+        var minVolume = byId("filterMinVolume");
+        var maxSpread = byId("filterMaxSpread");
+        var minLiquidity = byId("filterMinLiquidity");
+        var query = byId("filterQuery");
+        var sort = byId("sortSelect");
+        var pageSize = byId("pageSizeSelect");
+        if (selector) state.selector = selector.value || "top_volume";
+        if (sort) state.sort = sort.value || "volume_desc";
+        if (pageSize) state.limit = Number(pageSize.value || 25);
+        state.minVolume = minVolume ? minVolume.value : "";
+        state.maxSpreadBps = maxSpread ? maxSpread.value : "";
+        state.minLiquidityUsd = minLiquidity ? minLiquidity.value : "";
+        state.q = query ? query.value : "";
+        state.offset = 0;
+      }
+
+      function setupListeners() {
+        var refreshBtn = byId("refreshMarkets");
+        if (refreshBtn) refreshBtn.addEventListener("click", function () { fetchMarkets(); });
+
+        var prevBtn = byId("prevPage");
+        if (prevBtn) prevBtn.addEventListener("click", function () {
+          state.offset = Math.max(0, state.offset - state.limit);
+          fetchMarkets();
+        });
+
+        var nextBtn = byId("nextPage");
+        if (nextBtn) nextBtn.addEventListener("click", function () {
+          state.offset = Math.min(state.offset + state.limit, Math.max(0, state.totalCount - state.limit));
+          fetchMarkets();
+        });
+
+        var filterIds = ["filterSelector", "filterMinVolume", "filterMaxSpread", "filterMinLiquidity", "filterQuery", "sortSelect", "pageSizeSelect"];
+        filterIds.forEach(function (id) {
+          var el = byId(id);
+          if (!el) return;
+          el.addEventListener("change", function () {
+            applyFiltersFromUi();
+            fetchMarkets();
+          });
+          if (id === "filterQuery") {
+            el.addEventListener("keyup", function (event) {
+              if (event && event.key === "Enter") {
+                applyFiltersFromUi();
+                fetchMarkets();
+              }
+            });
+          }
+        });
+
+        var autoToggle = byId("autoRefreshToggle");
+        if (autoToggle) {
+          autoToggle.checked = false;
+          autoToggle.addEventListener("change", function () {
+            state.autoRefresh = autoToggle.checked;
+            if (state.autoRefresh) {
+              if (state.timer) clearInterval(state.timer);
+              state.timer = setInterval(function () {
+                fetchMarkets();
+              }, 15000);
+            } else if (state.timer) {
+              clearInterval(state.timer);
+              state.timer = null;
+            }
+          });
+        }
+      }
+
+      function init() {
+        setText("lastUpdated", "Last updated: --");
+        setupListeners();
+        fetchMarkets();
+      }
+
+      init();
+    </script>
+  </body>
+</html>`;
+}
+
 function startLoop(runtime: Runtime) {
   if (state.loopTimer) return;
   state.running = true;
@@ -2857,8 +3348,8 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
     }
 
     if (method === "GET" && url.pathname === "/markets") {
-      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("/markets page is not fully wired yet (renderMarketsPage missing). Please refresh later.");
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(renderMarketsPage(port));
       return;
     }
 
