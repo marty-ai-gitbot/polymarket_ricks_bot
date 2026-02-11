@@ -15,6 +15,7 @@ type Summary = {
   status: {
     running: boolean;
     mode: "paper" | "live";
+    paperOnly: boolean;
     selector: string;
     intervalMs: number;
     lastRunTime: string | null;
@@ -39,6 +40,34 @@ type Summary = {
     fractionalKelly: number;
     spreadFilter: string;
     depthFilter: string;
+  };
+  risk: {
+    settings: {
+      kellyFraction: number;
+      maxPosUsd: number;
+      maxDailyLossUsd: number;
+      maxPositions: number;
+      spreadBps: number;
+      minDepthUsd: number;
+    };
+    effective: {
+      kellyCapUsd: number;
+      maxPosUsd: number;
+      maxPosPct: number;
+      maxDailyLossUsd: number;
+      maxDailyLossPct: number;
+      maxPositions: number;
+      spreadBps: number;
+      minDepthUsd: number;
+    };
+    tight: {
+      kellyFraction: boolean;
+      maxPosUsd: boolean;
+      maxDailyLossUsd: boolean;
+      maxPositions: boolean;
+      spreadBps: boolean;
+      minDepthUsd: boolean;
+    };
   };
   selection: {
     mode: string;
@@ -129,11 +158,18 @@ type ActionRequest = {
     | "reset"
     | "set_mode"
     | "set_selector"
-    | "close_all";
+    | "close_all"
+    | "set_risk_params";
   value?: string | number | null;
   ticks?: number | null;
   intervalMs?: number | null;
   slugs?: string | null;
+  kellyFraction?: number | string | null;
+  maxPosUsd?: number | string | null;
+  maxDailyLossUsd?: number | string | null;
+  maxPositions?: number | string | null;
+  spreadBps?: number | string | null;
+  minDepthUsd?: number | string | null;
 };
 
 const DATA_DIR = path.resolve("./data");
@@ -148,6 +184,8 @@ const FILES = {
   selector: "selector.jsonl",
   events: "events.jsonl"
 };
+const UI_SETTINGS_FILE = "ui_settings.json";
+const PAPER_ONLY = true;
 
 const state = {
   running: false,
@@ -168,6 +206,101 @@ const healthCache = {
   clob: { status: "unknown" as HealthState, checkedAt: 0 },
   openai: { status: "unknown" as HealthState, checkedAt: 0 }
 };
+
+type UiRiskSettings = {
+  kellyFraction: number;
+  maxPosUsd: number;
+  maxDailyLossUsd: number;
+  maxPositions: number;
+  spreadBps: number;
+  minDepthUsd: number;
+  updatedAt: string;
+};
+
+let cachedUiSettings: UiRiskSettings | null = null;
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function defaultUiSettings(runtime: Runtime): UiRiskSettings {
+  const bankroll = runtime.env.BANKROLL_USD;
+  return {
+    kellyFraction: runtime.env.FRACTIONAL_KELLY,
+    maxPosUsd: runtime.env.MAX_RISK_PER_MARKET_USD,
+    maxDailyLossUsd: Math.max(0, bankroll * 0.05),
+    maxPositions: 3,
+    spreadBps: 25,
+    minDepthUsd: 200,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function clampNonNegative(value: number) {
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function normalizeUiSettings(runtime: Runtime, input: Partial<UiRiskSettings>): UiRiskSettings {
+  const fallback = defaultUiSettings(runtime);
+  const kellyFraction = clampNumber(safeNumber(input.kellyFraction, fallback.kellyFraction), 0, 1);
+  const maxPosUsd = clampNonNegative(safeNumber(input.maxPosUsd, fallback.maxPosUsd));
+  const maxDailyLossUsd = clampNonNegative(
+    safeNumber(input.maxDailyLossUsd, fallback.maxDailyLossUsd)
+  );
+  const maxPositions = Math.max(0, Math.floor(safeNumber(input.maxPositions, fallback.maxPositions)));
+  const spreadBps = clampNonNegative(safeNumber(input.spreadBps, fallback.spreadBps));
+  const minDepthUsd = clampNonNegative(safeNumber(input.minDepthUsd, fallback.minDepthUsd));
+  return {
+    kellyFraction,
+    maxPosUsd,
+    maxDailyLossUsd,
+    maxPositions,
+    spreadBps,
+    minDepthUsd,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function loadUiSettings(runtime: Runtime) {
+  ensureDataDir();
+  const filePath = path.join(DATA_DIR, UI_SETTINGS_FILE);
+  if (!fs.existsSync(filePath)) {
+    const defaults = defaultUiSettings(runtime);
+    fs.writeFileSync(filePath, JSON.stringify(defaults, null, 2), "utf8");
+    return defaults;
+  }
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<UiRiskSettings>;
+    return normalizeUiSettings(runtime, parsed);
+  } catch {
+    const defaults = defaultUiSettings(runtime);
+    fs.writeFileSync(filePath, JSON.stringify(defaults, null, 2), "utf8");
+    return defaults;
+  }
+}
+
+function persistUiSettings(runtime: Runtime, update: Partial<UiRiskSettings>) {
+  const current = cachedUiSettings ?? loadUiSettings(runtime);
+  const next = normalizeUiSettings(runtime, { ...current, ...update });
+  cachedUiSettings = next;
+  const filePath = path.join(DATA_DIR, UI_SETTINGS_FILE);
+  fs.writeFileSync(filePath, JSON.stringify(next, null, 2), "utf8");
+  runtime.env.FRACTIONAL_KELLY = next.kellyFraction;
+  runtime.env.MAX_RISK_PER_MARKET_USD = next.maxPosUsd;
+  return next;
+}
+
+function getUiSettings(runtime: Runtime) {
+  if (!cachedUiSettings) {
+    cachedUiSettings = loadUiSettings(runtime);
+    runtime.env.FRACTIONAL_KELLY = cachedUiSettings.kellyFraction;
+    runtime.env.MAX_RISK_PER_MARKET_USD = cachedUiSettings.maxPosUsd;
+  }
+  return cachedUiSettings;
+}
 
 function safeNumber(value: unknown, fallback = 0) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -274,6 +407,147 @@ function sumBy(entries: JsonValue[], keys: string[]) {
     }
   }
   return total;
+}
+
+function pickNumber(obj: Record<string, JsonValue>, keys: string[]) {
+  for (const key of keys) {
+    if (obj[key] !== undefined) {
+      const value = safeNumber(obj[key], NaN);
+      if (Number.isFinite(value)) return value;
+    }
+  }
+  return null;
+}
+
+function extractPnlValue(entry: JsonValue) {
+  if (!entry || typeof entry !== "object") return null;
+  const obj = entry as Record<string, JsonValue>;
+  const totalKeys = ["totalPnl", "total_pnl", "netPnl", "net_pnl", "pnl", "profit"];
+  const realizedKeys = ["realizedPnl", "realized_pnl", "realized"];
+  const unrealizedKeys = [
+    "unrealizedPnl",
+    "unrealized_pnl",
+    "unrealized",
+    "floatingPnl",
+    "markToMarket",
+    "mtm"
+  ];
+  const total = pickNumber(obj, totalKeys);
+  if (total != null) return total;
+  const realized = pickNumber(obj, realizedKeys);
+  const unrealized = pickNumber(obj, unrealizedKeys);
+  if (realized != null || unrealized != null) {
+    return (realized ?? 0) + (unrealized ?? 0);
+  }
+  return null;
+}
+
+type PnlPoint = { t: number; value: number };
+
+function buildPnlSeries(entries: JsonValue[], since: number, until: number) {
+  const points: PnlPoint[] = [];
+  let prior: PnlPoint | null = null;
+  for (const entry of entries) {
+    const ts = parseTimestamp(entry, 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    const value = extractPnlValue(entry);
+    if (value == null || !Number.isFinite(value)) continue;
+    if (ts < since) {
+      if (!prior || ts > prior.t) {
+        prior = { t: ts, value };
+      }
+      continue;
+    }
+    if (ts > until) continue;
+    points.push({ t: ts, value });
+  }
+  points.sort((a, b) => a.t - b.t);
+  if (prior && (points.length === 0 || prior.t < points[0].t)) {
+    points.unshift(prior);
+  }
+  const deduped: PnlPoint[] = [];
+  for (const point of points) {
+    const last = deduped[deduped.length - 1];
+    if (last && last.t === point.t) {
+      last.value = point.value;
+      continue;
+    }
+    deduped.push({ ...point });
+  }
+  const maxPoints = 240;
+  if (deduped.length <= maxPoints) return deduped;
+  const stride = Math.ceil(deduped.length / maxPoints);
+  const sampled: PnlPoint[] = [];
+  for (let i = 0; i < deduped.length; i += stride) {
+    sampled.push(deduped[i]);
+  }
+  const last = deduped[deduped.length - 1];
+  if (sampled[sampled.length - 1]?.t !== last.t) sampled.push(last);
+  return sampled;
+}
+
+function computeDrawdown(points: PnlPoint[]) {
+  let peak = Number.NEGATIVE_INFINITY;
+  let maxDrawdown = 0;
+  for (const point of points) {
+    if (point.value > peak) {
+      peak = point.value;
+      continue;
+    }
+    const dd = peak - point.value;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+  }
+  return maxDrawdown;
+}
+
+function valueAtOrBefore(points: PnlPoint[], ts: number) {
+  let candidate: PnlPoint | null = null;
+  for (const point of points) {
+    if (point.t <= ts) candidate = point;
+    else break;
+  }
+  return candidate;
+}
+
+function computePnlStats(points: PnlPoint[], since: number, until: number) {
+  if (points.length === 0) {
+    return {
+      current: 0,
+      dailyChange: 0,
+      drawdown: 0,
+      low: 0,
+      high: 0,
+      rangeStart: new Date(since).toISOString(),
+      rangeEnd: new Date(until).toISOString()
+    };
+  }
+  let low = Number.POSITIVE_INFINITY;
+  let high = Number.NEGATIVE_INFINITY;
+  for (const point of points) {
+    if (point.value < low) low = point.value;
+    if (point.value > high) high = point.value;
+  }
+  const current = points[points.length - 1].value;
+  const drawdown = computeDrawdown(points);
+  const dailyAnchor = valueAtOrBefore(points, until - 24 * 60 * 60 * 1000) ?? points[0];
+  const dailyChange = current - (dailyAnchor?.value ?? 0);
+  return {
+    current,
+    dailyChange,
+    drawdown,
+    low: Number.isFinite(low) ? low : current,
+    high: Number.isFinite(high) ? high : current,
+    rangeStart: new Date(points[0].t).toISOString(),
+    rangeEnd: new Date(points[points.length - 1].t).toISOString()
+  };
+}
+
+function resolvePnlRange(rangeRaw: string | null) {
+  const value = String(rangeRaw || "").toLowerCase();
+  if (value === "24h") return { label: "24h", ms: 24 * 60 * 60 * 1000 };
+  if (value === "7d") return { label: "7d", ms: 7 * 24 * 60 * 60 * 1000 };
+  if (value === "30d") return { label: "30d", ms: 30 * 24 * 60 * 60 * 1000 };
+  return { label: "7d", ms: 7 * 24 * 60 * 60 * 1000 };
 }
 
 function classifyApiError(err: unknown): { status: LiveMarketsStatus; message: string } {
@@ -870,8 +1144,22 @@ async function summarize(runtime: Runtime): Promise<Summary> {
   }, 0);
 
   const bankrollUsd = runtime.env.BANKROLL_USD;
-  const maxPositionUsd = runtime.env.MAX_RISK_PER_MARKET_USD;
+  const uiSettings = getUiSettings(runtime);
+  const kellyCapUsd = bankrollUsd * uiSettings.kellyFraction;
+  const effectiveMaxPosUsd = Math.min(uiSettings.maxPosUsd, kellyCapUsd);
+  const maxPositionUsd = effectiveMaxPosUsd;
   const riskPercent = bankrollUsd > 0 ? (maxPositionUsd / bankrollUsd) * 100 : 0;
+  const maxDailyLossPct = bankrollUsd > 0 ? (uiSettings.maxDailyLossUsd / bankrollUsd) * 100 : 0;
+
+  const tightKelly = uiSettings.kellyFraction <= 0.1;
+  const tightMaxPos =
+    effectiveMaxPosUsd <= 2 || (bankrollUsd > 0 && effectiveMaxPosUsd / bankrollUsd <= 0.01);
+  const tightDailyLoss =
+    uiSettings.maxDailyLossUsd <= 5 ||
+    (bankrollUsd > 0 && uiSettings.maxDailyLossUsd / bankrollUsd <= 0.02);
+  const tightMaxPositions = uiSettings.maxPositions <= 1;
+  const tightSpread = uiSettings.spreadBps <= 5;
+  const tightDepth = uiSettings.minDepthUsd >= Math.max(200, bankrollUsd * 0.5);
 
   const budgetDay = runtime.env.MAX_LLM_USD_PER_DAY;
   const budgetHour = runtime.env.MAX_LLM_USD_PER_HOUR;
@@ -905,6 +1193,7 @@ async function summarize(runtime: Runtime): Promise<Summary> {
     status: {
       running: state.running,
       mode: state.mode,
+      paperOnly: PAPER_ONLY,
       selector: state.selector,
       intervalMs: state.intervalMs,
       lastRunTime: state.lastRunTime
@@ -926,9 +1215,37 @@ async function summarize(runtime: Runtime): Promise<Summary> {
       bankrollUsd,
       maxPositionUsd,
       riskPercent,
-      fractionalKelly: runtime.env.FRACTIONAL_KELLY,
-      spreadFilter: "No spread filter configured",
-      depthFilter: "No depth filter configured"
+      fractionalKelly: uiSettings.kellyFraction,
+      spreadFilter: uiSettings.spreadBps > 0 ? `≤ ${uiSettings.spreadBps.toFixed(1)} bps` : "No spread filter configured",
+      depthFilter: uiSettings.minDepthUsd > 0 ? `≥ ${formatCurrency(uiSettings.minDepthUsd)}` : "No depth filter configured"
+    },
+    risk: {
+      settings: {
+        kellyFraction: uiSettings.kellyFraction,
+        maxPosUsd: uiSettings.maxPosUsd,
+        maxDailyLossUsd: uiSettings.maxDailyLossUsd,
+        maxPositions: uiSettings.maxPositions,
+        spreadBps: uiSettings.spreadBps,
+        minDepthUsd: uiSettings.minDepthUsd
+      },
+      effective: {
+        kellyCapUsd,
+        maxPosUsd: effectiveMaxPosUsd,
+        maxPosPct: bankrollUsd > 0 ? (effectiveMaxPosUsd / bankrollUsd) * 100 : 0,
+        maxDailyLossUsd: uiSettings.maxDailyLossUsd,
+        maxDailyLossPct,
+        maxPositions: uiSettings.maxPositions,
+        spreadBps: uiSettings.spreadBps,
+        minDepthUsd: uiSettings.minDepthUsd
+      },
+      tight: {
+        kellyFraction: tightKelly,
+        maxPosUsd: tightMaxPos,
+        maxDailyLossUsd: tightDailyLoss,
+        maxPositions: tightMaxPositions,
+        spreadBps: tightSpread,
+        minDepthUsd: tightDepth
+      }
     },
     selection: {
       mode: runtime.env.TARGETS_MODE,
@@ -1072,6 +1389,77 @@ function renderDashboard(port: number) {
           <div class="grid-card rounded-2xl p-6">
             <div class="flex items-center justify-between">
               <div>
+                <p class="text-xs uppercase tracking-[0.2em] text-rose-200">Risk Controls</p>
+                <h2 class="mt-2 text-lg font-semibold">Adjust Guardrails</h2>
+              </div>
+              <span class="chip rounded-full px-3 py-1 text-xs text-rose-200">Paper-only</span>
+            </div>
+            <div class="mt-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300">
+              <div class="flex items-center justify-between">
+                <span>Effective max position</span>
+                <span id="riskEffectiveMaxPos" class="text-slate-100">$0.00</span>
+              </div>
+              <div id="riskKellyCap" class="mt-2 text-slate-400">Kelly cap: --</div>
+              <div id="riskDailyLossCap" class="mt-1 text-slate-400">Daily loss cap: --</div>
+              <div id="riskMaxPositionsCap" class="mt-1 text-slate-400">Max positions: --</div>
+            </div>
+            <div class="mt-4 grid gap-3 sm:grid-cols-2">
+              <div>
+                <div class="flex items-center justify-between">
+                  <label class="text-xs text-slate-400">Kelly fraction</label>
+                  <span id="kellyWarning" class="hidden rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-200">Tight</span>
+                </div>
+                <input id="kellyFractionRange" class="mt-2 w-full accent-emerald-400" type="range" min="0" max="1" step="0.01" />
+                <input id="kellyFractionInput" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" max="1" step="0.01" />
+              </div>
+              <div>
+                <div class="flex items-center justify-between">
+                  <label class="text-xs text-slate-400">Max position (USD)</label>
+                  <span id="maxPosWarning" class="hidden rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-200">Tight</span>
+                </div>
+                <input id="maxPosUsdInput" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" step="0.01" />
+                <input id="maxPosPctInput" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" step="0.1" />
+                <p class="mt-1 text-[10px] text-slate-500">% bankroll</p>
+              </div>
+              <div>
+                <div class="flex items-center justify-between">
+                  <label class="text-xs text-slate-400">Max daily loss (USD)</label>
+                  <span id="dailyLossWarning" class="hidden rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-200">Tight</span>
+                </div>
+                <input id="maxDailyLossUsdInput" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" step="0.01" />
+                <p id="dailyLossPctLabel" class="mt-1 text-[10px] text-slate-500">--% bankroll</p>
+              </div>
+              <div>
+                <div class="flex items-center justify-between">
+                  <label class="text-xs text-slate-400">Max concurrent positions</label>
+                  <span id="positionsWarning" class="hidden rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-200">Tight</span>
+                </div>
+                <input id="maxPositionsInput" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" step="1" />
+              </div>
+              <div>
+                <div class="flex items-center justify-between">
+                  <label class="text-xs text-slate-400">Spread threshold (bps)</label>
+                  <span id="spreadWarning" class="hidden rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-200">Tight</span>
+                </div>
+                <input id="spreadBpsInput" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" step="0.1" />
+              </div>
+              <div>
+                <div class="flex items-center justify-between">
+                  <label class="text-xs text-slate-400">Min depth (USD)</label>
+                  <span id="depthWarning" class="hidden rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-200">Tight</span>
+                </div>
+                <input id="minDepthUsdInput" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="number" min="0" step="1" />
+              </div>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <button id="saveRisk" class="rounded-full bg-rose-400 px-4 py-2 text-xs font-semibold text-slate-950 transition hover:bg-rose-300" type="button">Save risk settings</button>
+              <span id="riskSaveStatus" class="text-xs text-slate-400">Not saved yet.</span>
+            </div>
+          </div>
+
+          <div class="grid-card rounded-2xl p-6">
+            <div class="flex items-center justify-between">
+              <div>
                 <p class="text-xs uppercase tracking-[0.2em] text-cyan-200">LLM / Analyst</p>
                 <h2 class="mt-2 text-lg font-semibold">Latest Analyses</h2>
               </div>
@@ -1115,6 +1503,79 @@ function renderDashboard(port: number) {
               </thead>
               <tbody id="marketsTable" class="text-slate-200"></tbody>
             </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid gap-6 lg:grid-cols-[1.6fr,1fr]">
+        <div class="grid-card rounded-2xl p-6">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.2em] text-emerald-200">Performance</p>
+              <h2 class="mt-2 text-lg font-semibold">PnL Over Time</h2>
+            </div>
+            <div class="flex items-center gap-2 text-xs">
+              <button class="pnl-range-btn rounded-full border border-slate-700 px-3 py-1 text-slate-300 transition hover:border-emerald-300" data-range="24h" type="button">24h</button>
+              <button class="pnl-range-btn rounded-full border border-emerald-400/60 bg-emerald-400/10 px-3 py-1 text-emerald-100" data-range="7d" type="button">7d</button>
+              <button class="pnl-range-btn rounded-full border border-slate-700 px-3 py-1 text-slate-300 transition hover:border-emerald-300" data-range="30d" type="button">30d</button>
+            </div>
+          </div>
+          <div class="mt-5 grid gap-4 sm:grid-cols-3">
+            <div class="rounded-2xl bg-slate-950/60 p-4 soft-ring">
+              <p class="text-xs uppercase tracking-widest text-slate-400">Current PnL</p>
+              <p id="pnlCurrent" class="mt-2 text-xl font-semibold text-emerald-300">$0.00</p>
+              <p id="pnlRangeLabel" class="mt-2 text-xs text-slate-400">Range: 7d</p>
+            </div>
+            <div class="rounded-2xl bg-slate-950/60 p-4 soft-ring">
+              <p class="text-xs uppercase tracking-widest text-slate-400">Daily Change</p>
+              <p id="pnlDaily" class="mt-2 text-xl font-semibold text-slate-100">$0.00</p>
+              <p id="pnlDailyNote" class="mt-2 text-xs text-slate-400">vs. 24h ago</p>
+            </div>
+            <div class="rounded-2xl bg-slate-950/60 p-4 soft-ring">
+              <p class="text-xs uppercase tracking-widest text-slate-400">Peak-to-trough</p>
+              <p id="pnlDrawdown" class="mt-2 text-xl font-semibold text-slate-100">$0.00</p>
+              <p class="mt-2 text-xs text-slate-400">Max drawdown</p>
+            </div>
+          </div>
+          <div class="mt-6">
+            <div id="pnlEmpty" class="rounded-2xl border border-dashed border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-sm text-slate-400">
+              No PnL data yet. Run the bot to generate paper executions.
+            </div>
+            <div class="relative hidden h-56 w-full overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/60 sm:h-64" id="pnlChartWrap">
+              <svg id="pnlChart" viewBox="0 0 640 240" class="h-full w-full"></svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-card rounded-2xl p-6">
+          <div class="flex items-center justify-between">
+            <div>
+              <p class="text-xs uppercase tracking-[0.2em] text-slate-300">PnL Details</p>
+              <h2 class="mt-2 text-lg font-semibold">Series Stats</h2>
+            </div>
+            <span id="pnlUpdated" class="text-xs text-slate-400">Updated --</span>
+          </div>
+          <div class="mt-4 space-y-3 text-sm">
+            <div class="flex items-center justify-between">
+              <span>Points</span>
+              <span id="pnlPoints" class="text-slate-200">0</span>
+            </div>
+            <div class="flex items-center justify-between">
+              <span>High</span>
+              <span id="pnlHigh" class="text-slate-200">$0.00</span>
+            </div>
+            <div class="flex items-center justify-between">
+              <span>Low</span>
+              <span id="pnlLow" class="text-slate-200">$0.00</span>
+            </div>
+            <div class="flex items-center justify-between text-xs text-slate-400">
+              <span>Range start</span>
+              <span id="pnlRangeStart">--</span>
+            </div>
+            <div class="flex items-center justify-between text-xs text-slate-400">
+              <span>Range end</span>
+              <span id="pnlRangeEnd">--</span>
+            </div>
           </div>
         </div>
       </section>
@@ -1264,6 +1725,16 @@ function renderDashboard(port: number) {
         mode: "paper",
         selector: "top_volume"
       };
+      var riskState = {
+        bankrollUsd: 0,
+        settings: null,
+        effective: null,
+        tight: null,
+        dirty: false
+      };
+      var pnlState = {
+        range: "7d"
+      };
 
       function byId(id) {
         return document.getElementById(id);
@@ -1274,6 +1745,13 @@ function renderDashboard(port: number) {
         if (el) {
           el.textContent = value;
         }
+      }
+
+      function setInputValue(id, value) {
+        var el = byId(id);
+        if (!el) return;
+        if (document.activeElement === el) return;
+        el.value = value;
       }
 
       function setBadge(el, state) {
@@ -1308,8 +1786,30 @@ function renderDashboard(port: number) {
         return String(value);
       }
 
+      function setWarning(id, on) {
+        var el = byId(id);
+        if (!el) return;
+        if (on) {
+          el.classList.remove("hidden");
+        } else {
+          el.classList.add("hidden");
+        }
+      }
+
+      function formatTimeLabel(ts) {
+        if (!ts) return "--";
+        var date = new Date(ts);
+        if (Number.isNaN(date.getTime())) return "--";
+        return date.toLocaleString();
+      }
+
       function fetchJson(url) {
         return fetch(url).then(function (res) { return res.json(); });
+      }
+
+      function fetchPnlSeries(range) {
+        var url = "/api/pnl_series?range=" + encodeURIComponent(String(range || "7d"));
+        return fetchJson(url);
       }
 
       function fetchLiveMarkets(limit, selector) {
@@ -1550,6 +2050,117 @@ function renderDashboard(port: number) {
         });
       }
 
+      function setPnlButtons(range) {
+        var buttons = document.querySelectorAll(".pnl-range-btn");
+        buttons.forEach(function (btn) {
+          var isActive = btn.getAttribute("data-range") === range;
+          btn.className = isActive
+            ? "pnl-range-btn rounded-full border border-emerald-400/60 bg-emerald-400/10 px-3 py-1 text-emerald-100"
+            : "pnl-range-btn rounded-full border border-slate-700 px-3 py-1 text-slate-300 transition hover:border-emerald-300";
+        });
+      }
+
+      function buildPnlSvg(points, width, height) {
+        if (!points || points.length === 0) return "";
+        var padding = 24;
+        var min = Number.POSITIVE_INFINITY;
+        var max = Number.NEGATIVE_INFINITY;
+        points.forEach(function (point) {
+          if (point.v < min) min = point.v;
+          if (point.v > max) max = point.v;
+        });
+        if (!Number.isFinite(min) || !Number.isFinite(max)) return "";
+        if (min === max) {
+          min -= 1;
+          max += 1;
+        }
+        var range = max - min;
+        var plotW = width - padding * 2;
+        var plotH = height - padding * 2;
+        var path = "";
+        points.forEach(function (point, idx) {
+          var x = padding + (idx / Math.max(1, points.length - 1)) * plotW;
+          var y = padding + (1 - (point.v - min) / range) * plotH;
+          path += (idx === 0 ? "M" : " L") + x.toFixed(2) + " " + y.toFixed(2);
+        });
+        var last = points[points.length - 1];
+        var lastX = padding + plotW;
+        var lastY = padding + (1 - (last.v - min) / range) * plotH;
+        var area = path + " L " + lastX.toFixed(2) + " " + (padding + plotH).toFixed(2) +
+          " L " + padding.toFixed(2) + " " + (padding + plotH).toFixed(2) + " Z";
+        var grid = "";
+        for (var i = 0; i <= 2; i += 1) {
+          var yLine = padding + (plotH / 2) * i;
+          grid += '<line x1="' + padding + '" y1="' + yLine.toFixed(2) +
+            '" x2="' + (padding + plotW) + '" y2="' + yLine.toFixed(2) +
+            '" stroke="rgba(148,163,184,0.2)" stroke-width="1" />';
+        }
+        var stroke = last.v >= 0 ? "#34d399" : "#f87171";
+        var fill = last.v >= 0 ? "rgba(52,211,153,0.16)" : "rgba(248,113,113,0.16)";
+        return (
+          '<rect width="100%" height="100%" fill="none" />' +
+          grid +
+          '<path d="' + area + '" fill="' + fill + '" />' +
+          '<path d="' + path + '" fill="none" stroke="' + stroke + '" stroke-width="2.5" />' +
+          '<circle cx="' + lastX.toFixed(2) + '" cy="' + lastY.toFixed(2) + '" r="4" fill="' + stroke + '" />'
+        );
+      }
+
+      function renderPnlSeries(payload, range) {
+        var series = (payload && payload.series) || [];
+        var points = series
+          .map(function (item) {
+            return { t: Date.parse(item.t), v: Number(item.v) };
+          })
+          .filter(function (item) { return Number.isFinite(item.t) && Number.isFinite(item.v); });
+        var stats = payload && payload.stats ? payload.stats : {};
+        var current = Number(stats.current || 0);
+        var daily = Number(stats.dailyChange || 0);
+        var drawdown = Number(stats.drawdown || 0);
+        var low = Number(stats.low || 0);
+        var high = Number(stats.high || 0);
+        var rangeStart = stats.rangeStart;
+        var rangeEnd = stats.rangeEnd;
+
+        var empty = byId("pnlEmpty");
+        var wrap = byId("pnlChartWrap");
+        var svg = byId("pnlChart");
+        if (empty && wrap) {
+          if (points.length < 2) {
+            empty.classList.remove("hidden");
+            wrap.classList.add("hidden");
+          } else {
+            empty.classList.add("hidden");
+            wrap.classList.remove("hidden");
+          }
+        }
+        if (svg && points.length >= 2) {
+          svg.innerHTML = buildPnlSvg(points, 640, 240);
+        } else if (svg) {
+          svg.innerHTML = "";
+        }
+
+        var currentEl = byId("pnlCurrent");
+        if (currentEl) {
+          currentEl.textContent = formatCurrency(current);
+          currentEl.className = "mt-2 text-xl font-semibold " + (current >= 0 ? "text-emerald-300" : "text-red-300");
+        }
+        var dailyEl = byId("pnlDaily");
+        if (dailyEl) {
+          dailyEl.textContent = formatCurrency(daily);
+          dailyEl.className = "mt-2 text-xl font-semibold " + (daily >= 0 ? "text-emerald-300" : "text-red-300");
+        }
+        var drawdownEl = byId("pnlDrawdown");
+        if (drawdownEl) drawdownEl.textContent = formatCurrency(drawdown);
+        setText("pnlRangeLabel", "Range: " + (range || payload.range || "7d"));
+        setText("pnlPoints", String(points.length));
+        setText("pnlHigh", formatCurrency(high));
+        setText("pnlLow", formatCurrency(low));
+        setText("pnlRangeStart", rangeStart ? new Date(rangeStart).toLocaleString() : "--");
+        setText("pnlRangeEnd", rangeEnd ? new Date(rangeEnd).toLocaleString() : "--");
+        setText("pnlUpdated", payload && payload.updatedAt ? "Updated " + new Date(payload.updatedAt).toLocaleTimeString() : "Updated --");
+      }
+
       function populateMarketSelect(items) {
         var select = byId("analysisMarket");
         if (!select) return;
@@ -1651,6 +2262,10 @@ function renderDashboard(port: number) {
         if (modeSelect) modeSelect.value = summary.status.mode;
         var selectorSelect = byId("selectorSelect");
         if (selectorSelect) selectorSelect.value = summary.status.selector;
+        if (summary.status.paperOnly && modeSelect) {
+          modeSelect.disabled = true;
+          modeSelect.className = "mt-2 w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-500";
+        }
         var closeBtn = byId("closeAll");
         if (closeBtn) {
           closeBtn.disabled = summary.status.mode !== "paper";
@@ -1658,6 +2273,59 @@ function renderDashboard(port: number) {
             ? "rounded-full border border-amber-400/50 px-4 py-2 text-xs font-semibold text-amber-200 transition hover:border-amber-300"
             : "rounded-full border border-slate-700 px-4 py-2 text-xs font-semibold text-slate-500";
         }
+        if (summary.risk) {
+          applyRiskSummary(summary.risk, summary.strategy.bankrollUsd || 0);
+        }
+      }
+
+      function applyRiskSummary(risk, bankrollUsd) {
+        riskState.bankrollUsd = Number(bankrollUsd || 0);
+        riskState.settings = risk.settings || {};
+        riskState.effective = risk.effective || {};
+        riskState.tight = risk.tight || {};
+
+        setText("riskEffectiveMaxPos", formatCurrency(risk.effective.maxPosUsd || 0));
+        setText("riskKellyCap", "Kelly cap: " + formatCurrency(risk.effective.kellyCapUsd || 0));
+        setText(
+          "riskDailyLossCap",
+          "Daily loss cap: " +
+            formatCurrency(risk.effective.maxDailyLossUsd || 0) +
+            " (" +
+            formatPercent(risk.effective.maxDailyLossPct || 0) +
+            ")"
+        );
+        setText(
+          "riskMaxPositionsCap",
+          "Max positions: " + String(risk.effective.maxPositions != null ? risk.effective.maxPositions : "--")
+        );
+
+        if (!riskState.dirty) {
+          setInputValue("kellyFractionRange", Number(risk.settings.kellyFraction || 0).toFixed(2));
+          setInputValue("kellyFractionInput", Number(risk.settings.kellyFraction || 0).toFixed(2));
+          setInputValue("maxPosUsdInput", Number(risk.settings.maxPosUsd || 0).toFixed(2));
+          setInputValue(
+            "maxPosPctInput",
+            riskState.bankrollUsd > 0
+              ? ((Number(risk.settings.maxPosUsd || 0) / riskState.bankrollUsd) * 100).toFixed(1)
+              : "0.0"
+          );
+          setInputValue("maxDailyLossUsdInput", Number(risk.settings.maxDailyLossUsd || 0).toFixed(2));
+          setInputValue("maxPositionsInput", String(risk.settings.maxPositions || 0));
+          setInputValue("spreadBpsInput", Number(risk.settings.spreadBps || 0).toFixed(1));
+          setInputValue("minDepthUsdInput", Number(risk.settings.minDepthUsd || 0).toFixed(0));
+        }
+
+        setText(
+          "dailyLossPctLabel",
+          formatPercent(risk.effective.maxDailyLossPct || 0) + " bankroll"
+        );
+
+        setWarning("kellyWarning", !!risk.tight.kellyFraction);
+        setWarning("maxPosWarning", !!risk.tight.maxPosUsd);
+        setWarning("dailyLossWarning", !!risk.tight.maxDailyLossUsd);
+        setWarning("positionsWarning", !!risk.tight.maxPositions);
+        setWarning("spreadWarning", !!risk.tight.spreadBps);
+        setWarning("depthWarning", !!risk.tight.minDepthUsd);
       }
 
       function refreshMarkets() {
@@ -1685,12 +2353,14 @@ function renderDashboard(port: number) {
               refreshMarkets(),
               fetchJson("/api/positions"),
               fetchJson("/api/analyses"),
-              fetchJson("/api/activity")
+              fetchJson("/api/activity"),
+              fetchPnlSeries(pnlState.range)
             ]).then(function (results) {
               renderPositions(results[1].positions || []);
               renderFills(results[1].fills || []);
               renderAnalyses(results[2].items || []);
               renderActivity(results[3].items || []);
+              renderPnlSeries(results[4], pnlState.range);
             });
           })
           .catch(function () {
@@ -1777,6 +2447,18 @@ function renderDashboard(port: number) {
         });
       }
 
+      var pnlButtons = document.querySelectorAll(".pnl-range-btn");
+      pnlButtons.forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var range = btn.getAttribute("data-range") || "7d";
+          pnlState.range = range;
+          setPnlButtons(range);
+          fetchPnlSeries(range)
+            .then(function (payload) { renderPnlSeries(payload, range); })
+            .catch(function () { renderPnlSeries({ series: [], stats: {} }, range); });
+        });
+      });
+
       var runAnalysisBtn = byId("runAnalysis");
       if (runAnalysisBtn) {
         runAnalysisBtn.addEventListener("click", function () {
@@ -1800,6 +2482,7 @@ function renderDashboard(port: number) {
       }
       var initialMs = Number(stored || document.body.getAttribute("data-refresh-ms") || 10000);
       if (!Number.isFinite(initialMs)) initialMs = 10000;
+      setPnlButtons(pnlState.range);
       setRefreshInterval(initialMs);
       refreshDashboard();
     </script>
@@ -1874,6 +2557,23 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
     if (method === "GET" && url.pathname === "/api/summary") {
       const summary = await summarize(runtime);
       respondJson(res, 200, summary);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/pnl_series") {
+      const range = resolvePnlRange(url.searchParams.get("range"));
+      const now = Date.now();
+      const since = now - range.ms;
+      const executions = readJsonl(path.join(DATA_DIR, FILES.executions)).entries;
+      const paper = readJsonl(path.join(DATA_DIR, FILES.paper)).entries;
+      const series = buildPnlSeries([...executions, ...paper], since, now);
+      const stats = computePnlStats(series, since, now);
+      respondJson(res, 200, {
+        range: range.label,
+        updatedAt: new Date(now).toISOString(),
+        series: series.map(point => ({ t: new Date(point.t).toISOString(), v: point.value })),
+        stats
+      });
       return;
     }
 
