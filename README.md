@@ -22,7 +22,7 @@ Paper-only local testing dashboard and CLI runner.
 pnpm bot:ui
 ```
 
-Open `http://localhost:3000` and use the dashboard to run a tick, view the last entries from `data/books.jsonl` and `data/orders.jsonl`, and reset local data.
+Open `http://localhost:3001` and use the dashboard to run a tick, view the last entries from `data/books.jsonl` and `data/orders.jsonl`, and reset local data.
 
 ### CLI one-shot
 ```bash
@@ -51,4 +51,16 @@ Run the server on a custom port:
 pnpm dev -- --port 4001
 ```
 
-All outputs are written under `data/` and visible in the testing dashboard at `http://localhost:3000/testing`.
+All outputs are written under `data/` and visible in the testing dashboard at `http://localhost:3001`.
+
+## UI tour
+The dashboard is a full trading + ops control center with every major system surfaced:
+
+- Overview/Hero: mode, selector, running state, markets analyzed today, open positions, total PnL, and LLM burn with remaining budgets.
+- Strategy: Kelly sizing inputs, bankroll, risk caps, and selector spread/depth filters.
+- Markets: selected market table with volume, spread, midpoint, and last update, plus a refresh button.
+- Positions & Orders: open positions table and paper fills/executions feed, with a paper-only close-all control.
+- LLM / Analyst: last analyses with probability, confidence, rationale previews, token usage, and per-analysis cost.
+- Activity: unified event stream sourced from `data/*.jsonl`.
+- System Health: Gamma/CLOB/OpenAI connectivity, uptime, memory usage, and data file counts.
+- Controls: start/stop loop, run once, run ticks, switch mode/selector/interval, and reset data.
