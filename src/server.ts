@@ -10,7 +10,7 @@ import type { GammaMarket } from "./polymarket/gamma_client.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-type HealthState = "connected" | "offline" | "unknown";
+type HealthState = "connected" | "offline" | "unknown" | "rate_limited";
 
 type Summary = {
   status: {
@@ -77,6 +77,7 @@ type Summary = {
   health: {
     gamma: HealthState;
     clob: HealthState;
+    clobDetail?: string | null;
     openai: HealthState;
     uptimeSec: number;
     memoryMb: number;
@@ -122,6 +123,21 @@ type LiveMarketsResponse = {
 };
 
 type LiveMarketsSort = "volume_desc" | "volume_asc" | "spread_asc" | "updated_desc";
+
+type MarketFilterFlags = {
+  activeOnly: boolean;
+  includeResolved: boolean;
+};
+
+type MarketFilterInput = MarketFilterFlags & {
+  nowMs: number;
+  minVolume: number | null;
+  maxSpreadBps: number | null;
+  minLiquidityUsd: number | null;
+  query: string;
+  selector: string;
+  slugList: string[];
+};
 
 type PositionSnapshot = {
   id: string;
@@ -206,12 +222,12 @@ const state = {
 const GAMMA_MARKETS_TTL_MS = 10000;
 const GAMMA_MARKETS_LIMIT = 1000;
 const CLOB_SUMMARY_TTL_MS = 15000;
+const CLOB_HEALTH_TTL_MS = 45000;
+const CLOB_HEALTH_TIMEOUT_MS = 1500;
 
-const gammaMarketsCache = {
-  fetchedAt: 0,
-  items: [] as GammaMarket[]
-};
-let gammaMarketsInFlight: Promise<GammaMarket[]> | null = null;
+type GammaCacheEntry = { fetchedAt: number; items: GammaMarket[] };
+const gammaMarketsCache = new Map<string, GammaCacheEntry>();
+const gammaMarketsInFlight = new Map<string, Promise<GammaMarket[]>>();
 const clobSummaryCache = new Map<
   string,
   {
@@ -224,7 +240,7 @@ const clobSummaryCache = new Map<
 
 const healthCache = {
   gamma: { status: "unknown" as HealthState, checkedAt: 0 },
-  clob: { status: "unknown" as HealthState, checkedAt: 0 },
+  clob: { status: "unknown" as HealthState, checkedAt: 0, reason: null as string | null },
   openai: { status: "unknown" as HealthState, checkedAt: 0 }
 };
 
@@ -336,6 +352,45 @@ function safeString(value: unknown, fallback = "") {
   if (typeof value === "string") return value;
   if (value === null || value === undefined) return fallback;
   return String(value);
+}
+
+function parseBooleanParam(value: string | null, fallback: boolean) {
+  if (value == null || value === "") return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function parseTimestampMs(value: unknown): number | null {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value <= 0) return null;
+    return value < 1_000_000_000_000 ? value * 1000 : value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      if (numeric <= 0) return null;
+      return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+    }
+    const parsed = Date.parse(trimmed);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return null;
+}
+
+function getMarketEndDateMs(market: GammaMarket): number | null {
+  if (market.endDate == null) return null;
+  return parseTimestampMs(market.endDate);
+}
+
+function isMarketResolved(market: GammaMarket) {
+  if (market.resolved === true) return true;
+  if (market.closed === true) return true;
+  return false;
 }
 
 function formatCurrency(value: number) {
@@ -580,12 +635,56 @@ function classifyApiError(err: unknown): { status: LiveMarketsStatus; message: s
   return { status: "offline", message: "Unable to reach Polymarket APIs." };
 }
 
+export function classifyClobHealthFailure(input: {
+  status?: number;
+  error?: unknown;
+}): { status: HealthState; reason: string } {
+  if (input.status === 429) {
+    return { status: "rate_limited", reason: "Rate limited by Polymarket CLOB (HTTP 429)." };
+  }
+  if (input.status != null) {
+    return { status: "offline", reason: `CLOB health check failed (HTTP ${input.status}).` };
+  }
+  const err = input.error as { name?: string } | undefined;
+  if (err?.name === "AbortError") {
+    return { status: "offline", reason: "CLOB health check timed out." };
+  }
+  const raw = String(input.error ?? "");
+  if (raw.includes("timed out")) {
+    return { status: "offline", reason: "CLOB health check timed out." };
+  }
+  if (raw.includes("429")) {
+    return { status: "rate_limited", reason: "Rate limited by Polymarket CLOB (HTTP 429)." };
+  }
+  return { status: "offline", reason: "Unable to reach Polymarket CLOB." };
+}
+
 function pickYesToken(tokens: Array<{ token_id: string; outcome: string }>) {
   return (
     tokens.find(token => String(token.outcome || "").toLowerCase() === "yes") ??
     tokens[0] ??
     null
   );
+}
+
+function pickSampleTokenIdFromMarkets(markets: GammaMarket[]) {
+  for (const market of markets) {
+    if (!market.active) continue;
+    if (!Array.isArray(market.tokens) || market.tokens.length === 0) continue;
+    const token = pickYesToken(market.tokens);
+    if (token?.token_id) return token.token_id;
+  }
+  return null;
+}
+
+function pickSampleTokenIdFromBooks(books: JsonValue[]) {
+  for (const entry of books) {
+    if (!entry || typeof entry !== "object") continue;
+    const obj = entry as Record<string, JsonValue>;
+    const token = obj.token as Record<string, JsonValue> | undefined;
+    if (token && token.token_id) return String(token.token_id);
+  }
+  return null;
 }
 
 function summarizeOrderBook(book: { bids: Array<{ price: number }>; asks: Array<{ price: number }> }) {
@@ -950,23 +1049,31 @@ function getMarketUpdatedAt(market: GammaMarket, fallbackIso: string) {
   return fallbackIso;
 }
 
-async function getGammaMarketsCached(runtime: Runtime) {
+async function getGammaMarketsCached(runtime: Runtime, flags: MarketFilterFlags) {
+  const key = `active=${flags.activeOnly ? "1" : "0"}|resolved=${flags.includeResolved ? "1" : "0"}`;
   const now = Date.now();
-  if (gammaMarketsCache.items.length > 0 && now - gammaMarketsCache.fetchedAt < GAMMA_MARKETS_TTL_MS) {
-    return { items: gammaMarketsCache.items, cached: true, ageMs: now - gammaMarketsCache.fetchedAt };
+  const cachedEntry = gammaMarketsCache.get(key);
+  if (cachedEntry && now - cachedEntry.fetchedAt < GAMMA_MARKETS_TTL_MS) {
+    return { items: cachedEntry.items, cached: true, ageMs: now - cachedEntry.fetchedAt };
   }
-  if (gammaMarketsInFlight) {
-    const items = await gammaMarketsInFlight;
-    return { items, cached: true, ageMs: now - gammaMarketsCache.fetchedAt };
+  const inFlight = gammaMarketsInFlight.get(key);
+  if (inFlight) {
+    const items = await inFlight;
+    const fresh = gammaMarketsCache.get(key);
+    const ageMs = fresh ? now - fresh.fetchedAt : 0;
+    return { items, cached: true, ageMs };
   }
-  gammaMarketsInFlight = runtime.gamma.listMarkets(GAMMA_MARKETS_LIMIT);
+  const request = runtime.gamma.listMarkets(GAMMA_MARKETS_LIMIT, {
+    activeOnly: flags.activeOnly,
+    includeResolved: flags.includeResolved
+  });
+  gammaMarketsInFlight.set(key, request);
   try {
-    const items = await gammaMarketsInFlight;
-    gammaMarketsCache.fetchedAt = Date.now();
-    gammaMarketsCache.items = items;
+    const items = await request;
+    gammaMarketsCache.set(key, { fetchedAt: Date.now(), items });
     return { items, cached: false, ageMs: 0 };
   } finally {
-    gammaMarketsInFlight = null;
+    gammaMarketsInFlight.delete(key);
   }
 }
 
@@ -976,6 +1083,67 @@ function normalizeSort(sortRaw: string, selector: string): LiveMarketsSort {
   }
   if (selector === "easy_targets") return "volume_asc";
   return "volume_desc";
+}
+
+export function filterGammaMarkets(markets: GammaMarket[], input: MarketFilterInput) {
+  const query = input.query.trim().toLowerCase();
+  const nowMs = input.nowMs;
+  return markets.filter(market => {
+    if (input.activeOnly && !market.active) return false;
+    if (!input.includeResolved && isMarketResolved(market)) return false;
+    const endDateMs = getMarketEndDateMs(market);
+    if (endDateMs != null && endDateMs < nowMs) return false;
+    if (input.selector === "slugs" && input.slugList.length > 0) {
+      const slug = String(market.slug ?? market.id);
+      if (!input.slugList.includes(slug)) return false;
+    }
+    if (query) {
+      const haystack = (String(market.slug || "") + " " + String(market.question || "")).toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    if (input.minVolume != null && (market.volumeNum ?? 0) < input.minVolume) return false;
+    if (input.minLiquidityUsd != null && (market.liquidityNum ?? 0) < input.minLiquidityUsd) return false;
+    if (input.maxSpreadBps != null) {
+      const token = pickYesToken(market.tokens);
+      if (token) {
+        const cachedSummary = getCachedClobSummary(token.token_id);
+        if (cachedSummary && cachedSummary.spreadBps != null && cachedSummary.spreadBps > input.maxSpreadBps) {
+          return false;
+        }
+      }
+    }
+    return true;
+  });
+}
+
+type SortableMarketRow = {
+  market: GammaMarket;
+  spreadBps: number | null;
+  updatedAt: string;
+};
+
+export function compareLiveMarketRows(a: SortableMarketRow, b: SortableMarketRow, sort: LiveMarketsSort) {
+  if (sort === "spread_asc") {
+    const aSpread = a.spreadBps == null ? Number.POSITIVE_INFINITY : a.spreadBps;
+    const bSpread = b.spreadBps == null ? Number.POSITIVE_INFINITY : b.spreadBps;
+    if (aSpread !== bSpread) return aSpread - bSpread;
+    const volumeDelta = (b.market.volumeNum ?? 0) - (a.market.volumeNum ?? 0);
+    if (volumeDelta !== 0) return volumeDelta;
+    return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
+  }
+  if (sort === "updated_desc") {
+    const updatedDelta = Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
+    if (updatedDelta !== 0) return updatedDelta;
+    return (b.market.volumeNum ?? 0) - (a.market.volumeNum ?? 0);
+  }
+  if (sort === "volume_asc") {
+    const volumeDelta = (a.market.volumeNum ?? 0) - (b.market.volumeNum ?? 0);
+    if (volumeDelta !== 0) return volumeDelta;
+    return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
+  }
+  const volumeDelta = (b.market.volumeNum ?? 0) - (a.market.volumeNum ?? 0);
+  if (volumeDelta !== 0) return volumeDelta;
+  return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
 }
 
 async function fetchLiveMarkets(
@@ -989,6 +1157,8 @@ async function fetchLiveMarkets(
     maxSpreadBps: number | null;
     minLiquidityUsd: number | null;
     q: string;
+    activeOnly: boolean;
+    includeResolved: boolean;
   }
 ): Promise<LiveMarketsResponse> {
   const nowIso = new Date().toISOString();
@@ -997,7 +1167,10 @@ async function fetchLiveMarkets(
   let ageMs = 0;
 
   try {
-    const gamma = await getGammaMarketsCached(runtime);
+    const gamma = await getGammaMarketsCached(runtime, {
+      activeOnly: opts.activeOnly,
+      includeResolved: opts.includeResolved
+    });
     markets = gamma.items;
     cached = gamma.cached;
     ageMs = gamma.ageMs;
@@ -1022,6 +1195,7 @@ async function fetchLiveMarkets(
   const minLiquidityUsd = opts.minLiquidityUsd != null && opts.minLiquidityUsd > 0 ? opts.minLiquidityUsd : null;
   const maxSpreadBps = opts.maxSpreadBps != null && opts.maxSpreadBps > 0 ? opts.maxSpreadBps : null;
   const query = opts.q.trim().toLowerCase();
+  const nowMs = Date.now();
 
   const slugList =
     selector === "slugs"
@@ -1031,31 +1205,19 @@ async function fetchLiveMarkets(
           .filter(Boolean)
       : [];
 
-  const filtered = markets.filter(market => {
-    if (!market.active) return false;
-    if (selector === "slugs" && slugList.length > 0) {
-      const slug = String(market.slug ?? market.id);
-      if (!slugList.includes(slug)) return false;
-    }
-    if (query) {
-      const haystack = (String(market.slug || "") + " " + String(market.question || "")).toLowerCase();
-      if (!haystack.includes(query)) return false;
-    }
-    if (minVolume != null && (market.volumeNum ?? 0) < minVolume) return false;
-    if (minLiquidityUsd != null && (market.liquidityNum ?? 0) < minLiquidityUsd) return false;
-    if (maxSpreadBps != null) {
-      const token = pickYesToken(market.tokens);
-      if (token) {
-        const cachedSummary = getCachedClobSummary(token.token_id);
-        if (cachedSummary && cachedSummary.spreadBps != null && cachedSummary.spreadBps > maxSpreadBps) {
-          return false;
-        }
-      }
-    }
-    return true;
+  const filtered = filterGammaMarkets(markets, {
+    activeOnly: opts.activeOnly,
+    includeResolved: opts.includeResolved,
+    nowMs,
+    minVolume,
+    maxSpreadBps,
+    minLiquidityUsd,
+    query,
+    selector,
+    slugList
   });
 
-  const sortable = filtered.map(market => {
+  const sortable: SortableMarketRow[] = filtered.map(market => {
     const token = pickYesToken(market.tokens);
     const cachedSummary = token ? getCachedClobSummary(token.token_id) : null;
     const spreadBps = cachedSummary ? cachedSummary.spreadBps : null;
@@ -1066,21 +1228,7 @@ async function fetchLiveMarkets(
     };
   });
 
-  sortable.sort((a, b) => {
-    if (sort === "spread_asc") {
-      const aSpread = a.spreadBps == null ? Number.POSITIVE_INFINITY : a.spreadBps;
-      const bSpread = b.spreadBps == null ? Number.POSITIVE_INFINITY : b.spreadBps;
-      if (aSpread !== bSpread) return aSpread - bSpread;
-      return (b.market.volumeNum ?? 0) - (a.market.volumeNum ?? 0);
-    }
-    if (sort === "updated_desc") {
-      return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
-    }
-    if (sort === "volume_asc") {
-      return (a.market.volumeNum ?? 0) - (b.market.volumeNum ?? 0);
-    }
-    return (b.market.volumeNum ?? 0) - (a.market.volumeNum ?? 0);
-  });
+  sortable.sort((a, b) => compareLiveMarketRows(a, b, sort));
 
   const totalCount = sortable.length;
   if (totalCount === 0) {
@@ -1174,6 +1322,8 @@ async function getLiveMarketsCached(
     maxSpreadBps: number | null;
     minLiquidityUsd: number | null;
     q: string;
+    activeOnly: boolean;
+    includeResolved: boolean;
   }
 ) {
   const limit = clampNumber(Math.floor(opts.limit), 1, 100);
@@ -1228,24 +1378,68 @@ async function checkGamma(runtime: Runtime, now: number) {
 
 async function checkClob(runtime: Runtime, now: number, sampleTokenId: string | null) {
   const cache = healthCache.clob;
-  if (now - cache.checkedAt < 60000) return cache.status;
+  if (now - cache.checkedAt < CLOB_HEALTH_TTL_MS) {
+    return { status: cache.status, reason: cache.reason };
+  }
   cache.checkedAt = now;
   if (!sampleTokenId) {
     cache.status = "unknown";
-    return cache.status;
+    cache.reason = "No token id available for CLOB health check.";
+    return { status: cache.status, reason: cache.reason };
   }
-  try {
+
+  const deadline = Date.now() + CLOB_HEALTH_TIMEOUT_MS;
+
+  const probe = async (path: string) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error("CLOB health check timed out.");
+    }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
-    const url = new URL("/book", runtime.env.POLYMARKET_CLOB_BASE_URL);
-    url.searchParams.set("token_id", sampleTokenId);
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timer);
-    cache.status = res.ok ? "connected" : "offline";
-  } catch {
-    cache.status = "offline";
+    const timer = setTimeout(() => controller.abort(), remaining);
+    try {
+      const url = new URL(path, runtime.env.POLYMARKET_CLOB_BASE_URL);
+      url.searchParams.set("token_id", sampleTokenId);
+      const res = await fetch(url, { signal: controller.signal });
+      if (res.ok) return { status: "connected" as HealthState, reason: null as string | null };
+      if (res.status === 429) {
+        return {
+          status: "rate_limited" as HealthState,
+          reason: "Rate limited by Polymarket CLOB.",
+          statusCode: 429
+        };
+      }
+      const classification = classifyClobHealthFailure({ status: res.status });
+      return { status: classification.status, reason: classification.reason, statusCode: res.status };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  try {
+    const primary = await probe("/midpoint");
+    if (primary.status === "connected" || primary.status === "rate_limited") {
+      cache.status = primary.status;
+      cache.reason = primary.reason ?? null;
+      return { status: cache.status, reason: cache.reason };
+    }
+    if (primary.status === "offline" && primary.statusCode != null) {
+      const statusCode = primary.statusCode;
+      if (statusCode === 404 || statusCode === 405) {
+        const fallback = await probe("/book");
+        cache.status = fallback.status;
+        cache.reason = fallback.reason ?? null;
+        return { status: cache.status, reason: cache.reason };
+      }
+    }
+    cache.status = primary.status;
+    cache.reason = primary.reason ?? null;
+  } catch (err) {
+    const classification = classifyClobHealthFailure({ error: err });
+    cache.status = classification.status;
+    cache.reason = classification.reason;
   }
-  return cache.status;
+  return { status: cache.status, reason: cache.reason };
 }
 
 async function checkOpenAI(runtime: Runtime, now: number) {
@@ -1337,14 +1531,15 @@ async function summarize(runtime: Runtime): Promise<Summary> {
   const memoryMb = process.memoryUsage().rss / 1024 / 1024;
   const uptimeSec = process.uptime();
 
-  const sampleTokenId = (() => {
-    for (const entry of books) {
-      if (!entry || typeof entry !== "object") continue;
-      const obj = entry as Record<string, JsonValue>;
-      const token = obj.token as Record<string, JsonValue> | undefined;
-      if (token && token.token_id) return String(token.token_id);
+  const sampleTokenId = await (async () => {
+    const fromBooks = pickSampleTokenIdFromBooks(books);
+    try {
+      const gamma = await getGammaMarketsCached(runtime);
+      const fromMarkets = pickSampleTokenIdFromMarkets(gamma.items);
+      return fromMarkets ?? fromBooks;
+    } catch {
+      return fromBooks;
     }
-    return null;
   })();
 
   const now = Date.now();
@@ -1416,7 +1611,8 @@ async function summarize(runtime: Runtime): Promise<Summary> {
     },
     health: {
       gamma,
-      clob,
+      clob: clob.status,
+      clobDetail: clob.reason ?? null,
       openai,
       uptimeSec,
       memoryMb,
@@ -1788,6 +1984,7 @@ function renderDashboard(port: number) {
               <span>CLOB</span>
               <span id="clobStatus" class="chip rounded-full px-3 py-1 text-xs">Unknown</span>
             </div>
+            <div id="clobDetail" class="text-xs text-slate-400 hidden">--</div>
             <div class="flex items-center justify-between">
               <span>Gamma</span>
               <span id="gammaStatus" class="chip rounded-full px-3 py-1 text-xs">Unknown</span>
@@ -1923,6 +2120,11 @@ function renderDashboard(port: number) {
         if (state === "connected") {
           el.className = cls + " bg-emerald-500/20 text-emerald-200";
           el.textContent = "Connected";
+          return;
+        }
+        if (state === "rate_limited") {
+          el.className = cls + " bg-amber-500/20 text-amber-200";
+          el.textContent = "Rate limited";
           return;
         }
         if (state === "offline") {
@@ -2420,6 +2622,17 @@ function renderDashboard(port: number) {
         setBadge(byId("clobStatus"), summary.health.clob);
         setBadge(byId("gammaStatus"), summary.health.gamma);
         setBadge(byId("openaiStatus"), summary.health.openai);
+        var clobDetail = byId("clobDetail");
+        if (clobDetail) {
+          var showDetail = (summary.health.clob === "offline" || summary.health.clob === "rate_limited") && summary.health.clobDetail;
+          if (showDetail) {
+            clobDetail.textContent = summary.health.clobDetail;
+            clobDetail.className = "text-xs text-slate-400";
+          } else {
+            clobDetail.textContent = "";
+            clobDetail.className = "text-xs text-slate-400 hidden";
+          }
+        }
         setRunningState(summary.status.running);
         var modeSelect = byId("modeSelect");
         if (modeSelect) modeSelect.value = summary.status.mode;
@@ -2874,6 +3087,16 @@ function renderMarketsPage(port: number) {
                 <label class="text-xs text-slate-400">Search</label>
                 <input id="filterQuery" class="mt-2 w-full rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100" type="text" placeholder="Search slug or question" />
               </div>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center gap-4 text-xs text-slate-400">
+              <label class="flex items-center gap-2">
+                <input id="filterActiveOnly" type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-cyan-400" checked />
+                Active only
+              </label>
+              <label class="flex items-center gap-2">
+                <input id="filterIncludeResolved" type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-cyan-400" />
+                Include resolved
+              </label>
             </div>
             <div class="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
               <div class="flex flex-wrap items-center gap-3">
@@ -3394,6 +3617,8 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
       const minLiquidityRaw = safeNumber(url.searchParams.get("min_liquidity_usd"), NaN);
       const minLiquidityUsd = Number.isFinite(minLiquidityRaw) ? minLiquidityRaw : null;
       const q = safeString(url.searchParams.get("q"), "");
+      const activeOnly = parseBooleanParam(url.searchParams.get("active_only"), true);
+      const includeResolved = parseBooleanParam(url.searchParams.get("include_resolved"), false);
       const payload = await getLiveMarketsCached(runtime, {
         limit,
         offset,
@@ -3402,7 +3627,9 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
         minVolume,
         maxSpreadBps,
         minLiquidityUsd,
-        q
+        q,
+        activeOnly,
+        includeResolved
       });
       const statusCode =
         payload.status === "rate_limited" ? 429 : payload.status === "offline" ? 503 : 200;
