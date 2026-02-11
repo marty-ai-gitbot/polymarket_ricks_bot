@@ -2857,8 +2857,8 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
     }
 
     if (method === "GET" && url.pathname === "/markets") {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(renderMarketsPage());
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("/markets page is not fully wired yet (renderMarketsPage missing). Please refresh later.");
       return;
     }
 
