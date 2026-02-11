@@ -6,6 +6,7 @@ import { URL } from "node:url";
 
 import type { Runtime } from "./runtime.js";
 import { runOnce, runTicks } from "./bot.js";
+import type { GammaMarket } from "./polymarket/gamma_client.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -101,7 +102,9 @@ type LiveMarketSnapshot = {
   slug: string;
   title: string;
   volume: number | null;
+  liquidityUsd: number | null;
   spread: number | null;
+  spreadBps: number | null;
   midpoint: number | null;
   updatedAt: string | null;
 };
@@ -109,6 +112,7 @@ type LiveMarketSnapshot = {
 type LiveMarketsStatus = "ok" | "partial" | "rate_limited" | "offline" | "empty";
 
 type LiveMarketsResponse = {
+  totalCount: number;
   items: LiveMarketSnapshot[];
   status: LiveMarketsStatus;
   updatedAt: string;
@@ -116,6 +120,8 @@ type LiveMarketsResponse = {
   cached?: boolean;
   ageMs?: number;
 };
+
+type LiveMarketsSort = "volume_desc" | "volume_asc" | "spread_asc" | "updated_desc";
 
 type PositionSnapshot = {
   id: string;
@@ -197,9 +203,24 @@ const state = {
   loopInFlight: false
 };
 
-const LIVE_MARKETS_TTL_MS = 10000;
-const liveMarketsCache = new Map<string, { fetchedAt: number; payload: LiveMarketsResponse }>();
-const liveMarketsInFlight = new Map<string, Promise<LiveMarketsResponse>>();
+const GAMMA_MARKETS_TTL_MS = 10000;
+const GAMMA_MARKETS_LIMIT = 1000;
+const CLOB_SUMMARY_TTL_MS = 15000;
+
+const gammaMarketsCache = {
+  fetchedAt: 0,
+  items: [] as GammaMarket[]
+};
+let gammaMarketsInFlight: Promise<GammaMarket[]> | null = null;
+const clobSummaryCache = new Map<
+  string,
+  {
+    fetchedAt: number;
+    midpoint: number | null;
+    spread: number | null;
+    spreadBps: number | null;
+  }
+>();
 
 const healthCache = {
   gamma: { status: "unknown" as HealthState, checkedAt: 0 },
@@ -894,23 +915,96 @@ function appendEvent(kind: string, message: string, detail?: Record<string, Json
   }
 }
 
-async function fetchLiveMarkets(runtime: Runtime, limit: number, selector: string): Promise<LiveMarketsResponse> {
+function getCachedClobSummary(tokenId: string) {
+  const cached = clobSummaryCache.get(tokenId);
+  if (!cached) return null;
+  if (Date.now() - cached.fetchedAt > CLOB_SUMMARY_TTL_MS) return null;
+  return cached;
+}
+
+async function fetchClobSummary(runtime: Runtime, tokenId: string) {
+  const cached = getCachedClobSummary(tokenId);
+  if (cached) return cached;
+  const book = await runtime.clob.getOrderBook(tokenId);
+  const summary = summarizeOrderBook(book);
+  const spreadBps = summary.spread != null ? summary.spread * 10000 : null;
+  const payload = {
+    fetchedAt: Date.now(),
+    midpoint: summary.midpoint,
+    spread: summary.spread,
+    spreadBps
+  };
+  clobSummaryCache.set(tokenId, payload);
+  return payload;
+}
+
+function getMarketUpdatedAt(market: GammaMarket, fallbackIso: string) {
+  const rawUpdatedAt =
+    (market as Record<string, unknown>).updatedAt ??
+    (market as Record<string, unknown>).updated_at ??
+    (market as Record<string, unknown>).lastUpdated ??
+    null;
+  if (!rawUpdatedAt) return fallbackIso;
+  const parsed = Date.parse(String(rawUpdatedAt));
+  if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+  return fallbackIso;
+}
+
+async function getGammaMarketsCached(runtime: Runtime) {
+  const now = Date.now();
+  if (gammaMarketsCache.items.length > 0 && now - gammaMarketsCache.fetchedAt < GAMMA_MARKETS_TTL_MS) {
+    return { items: gammaMarketsCache.items, cached: true, ageMs: now - gammaMarketsCache.fetchedAt };
+  }
+  if (gammaMarketsInFlight) {
+    const items = await gammaMarketsInFlight;
+    return { items, cached: true, ageMs: now - gammaMarketsCache.fetchedAt };
+  }
+  gammaMarketsInFlight = runtime.gamma.listMarkets(GAMMA_MARKETS_LIMIT);
+  try {
+    const items = await gammaMarketsInFlight;
+    gammaMarketsCache.fetchedAt = Date.now();
+    gammaMarketsCache.items = items;
+    return { items, cached: false, ageMs: 0 };
+  } finally {
+    gammaMarketsInFlight = null;
+  }
+}
+
+function normalizeSort(sortRaw: string, selector: string): LiveMarketsSort {
+  if (sortRaw === "spread_asc" || sortRaw === "updated_desc" || sortRaw === "volume_desc") {
+    return sortRaw;
+  }
+  if (selector === "easy_targets") return "volume_asc";
+  return "volume_desc";
+}
+
+async function fetchLiveMarkets(
+  runtime: Runtime,
+  opts: {
+    limit: number;
+    offset: number;
+    selector: string;
+    sort: string;
+    minVolume: number | null;
+    maxSpreadBps: number | null;
+    minLiquidityUsd: number | null;
+    q: string;
+  }
+): Promise<LiveMarketsResponse> {
   const nowIso = new Date().toISOString();
-  let markets: Array<{
-    id: string;
-    slug: string;
-    question: string;
-    active: boolean;
-    volumeNum?: number;
-    tokens: Array<{ token_id: string; outcome: string }>;
-    updatedAt?: string;
-  }>;
+  let markets: GammaMarket[];
+  let cached = false;
+  let ageMs = 0;
 
   try {
-    markets = await runtime.gamma.listMarkets(Math.max(200, limit));
+    const gamma = await getGammaMarketsCached(runtime);
+    markets = gamma.items;
+    cached = gamma.cached;
+    ageMs = gamma.ageMs;
   } catch (err) {
     const classification = classifyApiError(err);
     return {
+      totalCount: 0,
       items: [],
       status: classification.status,
       updatedAt: nowIso,
@@ -918,26 +1012,110 @@ async function fetchLiveMarkets(runtime: Runtime, limit: number, selector: strin
     };
   }
 
-  const ranked = selectMarkets(markets, selector, limit);
-  if (ranked.length === 0) {
-    return { items: [], status: "empty", updatedAt: nowIso };
+  const selectorRaw = opts.selector;
+  const selector =
+    selectorRaw === "easy_targets" || selectorRaw === "top_volume" || selectorRaw === "slugs"
+      ? selectorRaw
+      : "top_volume";
+  const sort = normalizeSort(opts.sort, selector);
+  const minVolume = opts.minVolume != null && opts.minVolume > 0 ? opts.minVolume : null;
+  const minLiquidityUsd = opts.minLiquidityUsd != null && opts.minLiquidityUsd > 0 ? opts.minLiquidityUsd : null;
+  const maxSpreadBps = opts.maxSpreadBps != null && opts.maxSpreadBps > 0 ? opts.maxSpreadBps : null;
+  const query = opts.q.trim().toLowerCase();
+
+  const slugList =
+    selector === "slugs"
+      ? String(runtime.env.TARGET_SLUGS || "")
+          .split(",")
+          .map(value => value.trim())
+          .filter(Boolean)
+      : [];
+
+  const filtered = markets.filter(market => {
+    if (!market.active) return false;
+    if (selector === "slugs" && slugList.length > 0) {
+      const slug = String(market.slug ?? market.id);
+      if (!slugList.includes(slug)) return false;
+    }
+    if (query) {
+      const haystack = (String(market.slug || "") + " " + String(market.question || "")).toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    if (minVolume != null && (market.volumeNum ?? 0) < minVolume) return false;
+    if (minLiquidityUsd != null && (market.liquidityNum ?? 0) < minLiquidityUsd) return false;
+    if (maxSpreadBps != null) {
+      const token = pickYesToken(market.tokens);
+      if (token) {
+        const cachedSummary = getCachedClobSummary(token.token_id);
+        if (cachedSummary && cachedSummary.spreadBps != null && cachedSummary.spreadBps > maxSpreadBps) {
+          return false;
+        }
+      }
+    }
+    return true;
+  });
+
+  const sortable = filtered.map(market => {
+    const token = pickYesToken(market.tokens);
+    const cachedSummary = token ? getCachedClobSummary(token.token_id) : null;
+    const spreadBps = cachedSummary ? cachedSummary.spreadBps : null;
+    return {
+      market,
+      spreadBps,
+      updatedAt: getMarketUpdatedAt(market, nowIso)
+    };
+  });
+
+  sortable.sort((a, b) => {
+    if (sort === "spread_asc") {
+      const aSpread = a.spreadBps == null ? Number.POSITIVE_INFINITY : a.spreadBps;
+      const bSpread = b.spreadBps == null ? Number.POSITIVE_INFINITY : b.spreadBps;
+      if (aSpread !== bSpread) return aSpread - bSpread;
+      return (b.market.volumeNum ?? 0) - (a.market.volumeNum ?? 0);
+    }
+    if (sort === "updated_desc") {
+      return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
+    }
+    if (sort === "volume_asc") {
+      return (a.market.volumeNum ?? 0) - (b.market.volumeNum ?? 0);
+    }
+    return (b.market.volumeNum ?? 0) - (a.market.volumeNum ?? 0);
+  });
+
+  const totalCount = sortable.length;
+  if (totalCount === 0) {
+    return {
+      totalCount,
+      items: [],
+      status: "empty",
+      updatedAt: nowIso,
+      cached,
+      ageMs
+    };
   }
+
+  const start = clampNumber(Math.floor(opts.offset), 0, Math.max(0, totalCount));
+  const end = clampNumber(start + opts.limit, 0, totalCount);
+  const page = sortable.slice(start, end);
 
   let clobErrors = 0;
   let clobSuccess = 0;
   let clobRateLimited = false;
 
-  const items = await mapWithConcurrency(ranked, 5, async market => {
+  const items = await mapWithConcurrency(page, 4, async row => {
+    const market = row.market;
     const token = pickYesToken(market.tokens);
-    let midpoint: number | null = null;
-    let spread: number | null = null;
+    const cachedSummary = token ? getCachedClobSummary(token.token_id) : null;
+    let midpoint: number | null = cachedSummary ? cachedSummary.midpoint : null;
+    let spread: number | null = cachedSummary ? cachedSummary.spread : null;
+    let spreadBps: number | null = cachedSummary ? cachedSummary.spreadBps : null;
 
-    if (token) {
+    if (token && spreadBps == null) {
       try {
-        const book = await runtime.clob.getOrderBook(token.token_id);
-        const summary = summarizeOrderBook(book);
+        const summary = await fetchClobSummary(runtime, token.token_id);
         midpoint = summary.midpoint;
         spread = summary.spread;
+        spreadBps = summary.spreadBps;
         clobSuccess += 1;
       } catch (err) {
         clobErrors += 1;
@@ -946,25 +1124,16 @@ async function fetchLiveMarkets(runtime: Runtime, limit: number, selector: strin
       }
     }
 
-    const rawUpdatedAt =
-      (market as Record<string, unknown>).updatedAt ??
-      (market as Record<string, unknown>).updated_at ??
-      (market as Record<string, unknown>).lastUpdated ??
-      null;
-    let updatedAt = nowIso;
-    if (rawUpdatedAt) {
-      const parsed = Date.parse(String(rawUpdatedAt));
-      if (!Number.isNaN(parsed)) updatedAt = new Date(parsed).toISOString();
-    }
-
     return {
       id: market.id,
       slug: safeString(market.slug, market.id),
       title: safeString(market.question, safeString(market.slug, market.id)),
       volume: market.volumeNum ?? null,
+      liquidityUsd: market.liquidityNum ?? null,
       spread,
+      spreadBps,
       midpoint,
-      updatedAt
+      updatedAt: row.updatedAt
     };
   });
 
@@ -984,38 +1153,32 @@ async function fetchLiveMarkets(runtime: Runtime, limit: number, selector: strin
   }
 
   return {
+    totalCount,
     items,
     status,
     updatedAt: nowIso,
-    error
+    error,
+    cached,
+    ageMs
   };
 }
 
-async function getLiveMarketsCached(runtime: Runtime, limit: number, selector: string): Promise<LiveMarketsResponse> {
-  const key = `${selector}:${limit}`;
-  const now = Date.now();
-  const cached = liveMarketsCache.get(key);
-  if (cached && now - cached.fetchedAt < LIVE_MARKETS_TTL_MS) {
-    return {
-      ...cached.payload,
-      cached: true,
-      ageMs: now - cached.fetchedAt
-    };
+async function getLiveMarketsCached(
+  runtime: Runtime,
+  opts: {
+    limit: number;
+    offset: number;
+    selector: string;
+    sort: string;
+    minVolume: number | null;
+    maxSpreadBps: number | null;
+    minLiquidityUsd: number | null;
+    q: string;
   }
-
-  const inFlight = liveMarketsInFlight.get(key);
-  if (inFlight) return inFlight;
-
-  const promise = fetchLiveMarkets(runtime, limit, selector);
-  liveMarketsInFlight.set(key, promise);
-
-  try {
-    const payload = await promise;
-    liveMarketsCache.set(key, { fetchedAt: Date.now(), payload });
-    return payload;
-  } finally {
-    liveMarketsInFlight.delete(key);
-  }
+) {
+  const limit = clampNumber(Math.floor(opts.limit), 1, 100);
+  const offset = clampNumber(Math.floor(opts.offset), 0, Number.MAX_SAFE_INTEGER);
+  return fetchLiveMarkets(runtime, { ...opts, limit, offset });
 }
 
 function clearJsonlFiles(dir: string) {
@@ -2693,6 +2856,12 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/markets") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(renderMarketsPage());
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/summary") {
       const summary = await summarize(runtime);
       respondJson(res, 200, summary);
@@ -2717,14 +2886,33 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
     }
 
     if (method === "GET" && url.pathname === "/api/markets/live") {
-      const limitRaw = safeNumber(url.searchParams.get("limit"), 15);
-      const limit = clampNumber(Math.floor(limitRaw), 1, 50);
+      const limitRaw = safeNumber(url.searchParams.get("limit"), 25);
+      const offsetRaw = safeNumber(url.searchParams.get("offset"), 0);
+      const limit = clampNumber(Math.floor(limitRaw), 1, 100);
+      const offset = clampNumber(Math.floor(offsetRaw), 0, Number.MAX_SAFE_INTEGER);
       const selectorRaw = safeString(url.searchParams.get("selector"), state.selector);
       const selector =
         selectorRaw === "easy_targets" || selectorRaw === "top_volume" || selectorRaw === "slugs"
           ? selectorRaw
           : state.selector;
-      const payload = await getLiveMarketsCached(runtime, limit, selector);
+      const sort = safeString(url.searchParams.get("sort"), "");
+      const minVolumeRaw = safeNumber(url.searchParams.get("min_volume"), NaN);
+      const minVolume = Number.isFinite(minVolumeRaw) ? minVolumeRaw : null;
+      const maxSpreadRaw = safeNumber(url.searchParams.get("max_spread_bps"), NaN);
+      const maxSpreadBps = Number.isFinite(maxSpreadRaw) ? maxSpreadRaw : null;
+      const minLiquidityRaw = safeNumber(url.searchParams.get("min_liquidity_usd"), NaN);
+      const minLiquidityUsd = Number.isFinite(minLiquidityRaw) ? minLiquidityRaw : null;
+      const q = safeString(url.searchParams.get("q"), "");
+      const payload = await getLiveMarketsCached(runtime, {
+        limit,
+        offset,
+        selector,
+        sort,
+        minVolume,
+        maxSpreadBps,
+        minLiquidityUsd,
+        q
+      });
       const statusCode =
         payload.status === "rate_limited" ? 429 : payload.status === "offline" ? 503 : 200;
       respondJson(res, statusCode, payload);
