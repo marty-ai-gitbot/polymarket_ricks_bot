@@ -2326,6 +2326,11 @@ function renderDashboard(port: number) {
         setWarning("positionsWarning", !!risk.tight.maxPositions);
         setWarning("spreadWarning", !!risk.tight.spreadBps);
         setWarning("depthWarning", !!risk.tight.minDepthUsd);
+
+        if (!riskState.dirty) {
+          var status = byId("riskSaveStatus");
+          if (status) status.textContent = "Settings synced.";
+        }
       }
 
       function refreshMarkets() {
@@ -2376,11 +2381,137 @@ function renderDashboard(port: number) {
         }).then(function (res) { return res.json(); });
       }
 
+      function setRiskDirty(dirty) {
+        riskState.dirty = dirty;
+        var status = byId("riskSaveStatus");
+        if (status) {
+          status.textContent = dirty ? "Unsaved changes." : "Settings synced.";
+        }
+      }
+
+      function readRiskForm() {
+        var kelly = Number(byId("kellyFractionInput").value || 0);
+        var maxPosUsd = Number(byId("maxPosUsdInput").value || 0);
+        var maxDailyLossUsd = Number(byId("maxDailyLossUsdInput").value || 0);
+        var maxPositions = Number(byId("maxPositionsInput").value || 0);
+        var spreadBps = Number(byId("spreadBpsInput").value || 0);
+        var minDepthUsd = Number(byId("minDepthUsdInput").value || 0);
+        return {
+          kellyFraction: kelly,
+          maxPosUsd: maxPosUsd,
+          maxDailyLossUsd: maxDailyLossUsd,
+          maxPositions: maxPositions,
+          spreadBps: spreadBps,
+          minDepthUsd: minDepthUsd
+        };
+      }
+
+      function syncKellyInputs(value) {
+        var clamped = Math.min(1, Math.max(0, Number(value || 0)));
+        setInputValue("kellyFractionRange", clamped.toFixed(2));
+        setInputValue("kellyFractionInput", clamped.toFixed(2));
+      }
+
+      function syncMaxPosFromPercent(value) {
+        var pct = Math.max(0, Number(value || 0));
+        var usd = riskState.bankrollUsd > 0 ? (pct / 100) * riskState.bankrollUsd : 0;
+        setInputValue("maxPosUsdInput", usd.toFixed(2));
+      }
+
+      function syncPercentFromMaxPos(value) {
+        var usd = Math.max(0, Number(value || 0));
+        var pct = riskState.bankrollUsd > 0 ? (usd / riskState.bankrollUsd) * 100 : 0;
+        setInputValue("maxPosPctInput", pct.toFixed(1));
+      }
+
       var refreshSelect = byId("refreshInterval");
       if (refreshSelect) {
         refreshSelect.addEventListener("change", function (event) {
           var value = Number(event.target.value || 10000);
           setRefreshInterval(value);
+        });
+      }
+
+      var kellyRange = byId("kellyFractionRange");
+      if (kellyRange) {
+        kellyRange.addEventListener("input", function (event) {
+          syncKellyInputs(event.target.value);
+          setRiskDirty(true);
+        });
+      }
+
+      var kellyInput = byId("kellyFractionInput");
+      if (kellyInput) {
+        kellyInput.addEventListener("input", function (event) {
+          syncKellyInputs(event.target.value);
+          setRiskDirty(true);
+        });
+      }
+
+      var maxPosUsdInput = byId("maxPosUsdInput");
+      if (maxPosUsdInput) {
+        maxPosUsdInput.addEventListener("input", function (event) {
+          syncPercentFromMaxPos(event.target.value);
+          setRiskDirty(true);
+        });
+      }
+
+      var maxPosPctInput = byId("maxPosPctInput");
+      if (maxPosPctInput) {
+        maxPosPctInput.addEventListener("input", function (event) {
+          syncMaxPosFromPercent(event.target.value);
+          setRiskDirty(true);
+        });
+      }
+
+      var maxDailyLossUsdInput = byId("maxDailyLossUsdInput");
+      if (maxDailyLossUsdInput) {
+        maxDailyLossUsdInput.addEventListener("input", function () {
+          setRiskDirty(true);
+        });
+      }
+
+      var maxPositionsInput = byId("maxPositionsInput");
+      if (maxPositionsInput) {
+        maxPositionsInput.addEventListener("input", function () {
+          setRiskDirty(true);
+        });
+      }
+
+      var spreadBpsInput = byId("spreadBpsInput");
+      if (spreadBpsInput) {
+        spreadBpsInput.addEventListener("input", function () {
+          setRiskDirty(true);
+        });
+      }
+
+      var minDepthUsdInput = byId("minDepthUsdInput");
+      if (minDepthUsdInput) {
+        minDepthUsdInput.addEventListener("input", function () {
+          setRiskDirty(true);
+        });
+      }
+
+      var saveRiskBtn = byId("saveRisk");
+      if (saveRiskBtn) {
+        saveRiskBtn.addEventListener("click", function () {
+          var status = byId("riskSaveStatus");
+          if (status) status.textContent = "Saving...";
+          var payload = readRiskForm();
+          postAction({
+            action: "set_risk_params",
+            kellyFraction: payload.kellyFraction,
+            maxPosUsd: payload.maxPosUsd,
+            maxDailyLossUsd: payload.maxDailyLossUsd,
+            maxPositions: payload.maxPositions,
+            spreadBps: payload.spreadBps,
+            minDepthUsd: payload.minDepthUsd
+          }).then(function () {
+            setRiskDirty(false);
+            refreshDashboard();
+          }).catch(function () {
+            if (status) status.textContent = "Save failed.";
+          });
         });
       }
 
@@ -2518,6 +2649,9 @@ function stopLoop() {
 }
 
 function setMode(runtime: Runtime, mode: "paper" | "live") {
+  if (PAPER_ONLY && mode === "live") {
+    return false;
+  }
   state.mode = mode;
   if (mode === "paper") {
     runtime.env.PAPER = true;
@@ -2528,6 +2662,7 @@ function setMode(runtime: Runtime, mode: "paper" | "live") {
     runtime.env.LIVE = true;
     runtime.env.DRY_RUN = false;
   }
+  return true;
 }
 
 function setSelector(runtime: Runtime, selector: string, slugs?: string | null) {
@@ -2543,6 +2678,10 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
   if (runtime.env.PAPER && !runtime.env.LIVE) state.mode = "paper";
   if (runtime.env.LIVE) state.mode = "live";
   state.selector = runtime.env.TARGETS_MODE;
+  getUiSettings(runtime);
+  if (PAPER_ONLY) {
+    setMode(runtime, "paper");
+  }
 
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
@@ -2675,8 +2814,13 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
         if (parsed.action === "set_mode") {
           const modeValue = String(parsed.value || "").toLowerCase();
           if (modeValue === "paper" || modeValue === "live") {
-            setMode(runtime, modeValue);
-            appendEvent("config", "Mode updated", { mode: modeValue });
+            const ok = setMode(runtime, modeValue);
+            if (ok) {
+              appendEvent("config", "Mode updated", { mode: modeValue });
+            } else {
+              respondJson(res, 400, { ok: false, error: "Live trading disabled (paper-only)" });
+              return;
+            }
           }
           respondJson(res, 200, { ok: true, mode: state.mode });
           return;
@@ -2699,6 +2843,25 @@ export function startServer(runtime: Runtime, opts: { port?: number } = {}) {
           if (fs.existsSync(ordersPath)) fs.rmSync(ordersPath);
           appendEvent("trade", "All paper positions closed");
           respondJson(res, 200, { ok: true, closed: true });
+          return;
+        }
+        if (parsed.action === "set_risk_params") {
+          if (state.mode !== "paper" || !runtime.env.PAPER) {
+            respondJson(res, 400, { ok: false, error: "Risk params can only be updated in paper mode" });
+            return;
+          }
+          const settings = persistUiSettings(runtime, {
+            kellyFraction: parsed.kellyFraction == null ? undefined : safeNumber(parsed.kellyFraction, 0),
+            maxPosUsd: parsed.maxPosUsd == null ? undefined : safeNumber(parsed.maxPosUsd, 0),
+            maxDailyLossUsd:
+              parsed.maxDailyLossUsd == null ? undefined : safeNumber(parsed.maxDailyLossUsd, 0),
+            maxPositions:
+              parsed.maxPositions == null ? undefined : safeNumber(parsed.maxPositions, 0),
+            spreadBps: parsed.spreadBps == null ? undefined : safeNumber(parsed.spreadBps, 0),
+            minDepthUsd: parsed.minDepthUsd == null ? undefined : safeNumber(parsed.minDepthUsd, 0)
+          });
+          appendEvent("config", "Risk params updated", { ...settings });
+          respondJson(res, 200, { ok: true, settings });
           return;
         }
         respondJson(res, 400, { ok: false, error: "Unknown action" });

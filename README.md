@@ -53,6 +53,14 @@ pnpm dev -- --port 4001
 
 All outputs are written under `data/` and visible in the testing dashboard at `http://localhost:3001`.
 
+## Risk controls in UI
+The dashboard includes a paper-only risk control panel for adjusting guardrails without touching `.env`.
+
+- Controls: Kelly fraction (0.0–1.0), max position size (USD or % bankroll), max daily loss, max concurrent positions, spread threshold (bps), and minimum depth (USD).
+- Display: effective caps (Kelly cap, effective max position, daily loss %, max positions) plus tight-cap warning badges.
+- Persistence: settings are stored in `data/ui_settings.json` and loaded on server start.
+- API: `POST /api/action` with `{ "action": "set_risk_params", "kellyFraction", "maxPosUsd", "maxDailyLossUsd", "maxPositions", "spreadBps", "minDepthUsd" }`.
+
 ## UI tour
 The dashboard is a full trading + ops control center with every major system surfaced:
 
